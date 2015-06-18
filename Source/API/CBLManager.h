@@ -42,6 +42,9 @@ typedef struct CBLManagerOptions {
 /** Default initializer. Stores databases in the default directory. */
 - (instancetype) init;
 
+/** DRU 18.06.2015: Added parameter to init-function */
+- (instancetype) initWithExceptionOnWarning: (BOOL)exceptionOnWarning;
+
 /** Initializes a CouchbaseLite manager that stores its data at the given path.
     @param directory  Path to data directory. If it doesn't already exist it will be created.
     @param options  If non-NULL, a pointer to options (read-only and no-replicator).

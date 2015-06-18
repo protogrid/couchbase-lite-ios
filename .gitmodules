@@ -3,7 +3,8 @@
 	url = git://github.com/couchbaselabs/CocoaHTTPServer.git
 [submodule "vendor/MYUtilities"]
 	path = vendor/MYUtilities
-	url = git://github.com/snej/MYUtilities.git
+	url = git@github.com:protogrid/MYUtilities.git
+	ignore = all
 [submodule "vendor/oauthconsumer"]
 	path = vendor/oauthconsumer
 	url = git://github.com/couchbaselabs/ios-oauthconsumer.git
