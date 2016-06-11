@@ -19,6 +19,7 @@
 #define AssertEqual     XCTAssertEqualObjects
 #define AssertNil       XCTAssertNil
 #define RequireTestCase(TC) // ignored; there's no equivalent of this
+#define UsingLogDomain(D)
 
 #define Log             NSLog
 #define Warn(FMT, ...)  NSLog(@"WARNING: " FMT, ##__VA_ARGS__)
@@ -32,6 +33,8 @@
 // Adds a non-persistent credential to the NSURLCredentialStorage.
 void AddTemporaryCredential(NSURL* url, NSString* realm,
                             NSString* username, NSString* password);
+void RemoveTemporaryCredential(NSURL* url, NSString* realm,
+                               NSString* username, NSString* password);
 
 
 /** Base class for Couchbase Lite unit tests. */
@@ -43,8 +46,14 @@ void AddTemporaryCredential(NSURL* url, NSString* realm,
 /** Returns the contents of a named test fixture in the unit-test bundle. */
 - (NSData*) contentsOfTestFile: (NSString*)name;
 
+@property (readonly) NSInteger iOSVersion;      // Returns 0 on Mac OS
+@property (readonly) NSInteger macOSVersion;    // Returns 0 on iOS, minor version ('10.*') on Mac
+
 // internal:
 - (void) _assertEqualish: (id)a to: (id)b;
+
+- (void) allowWarningsIn: (void (^)())block;
+
 @end
 
 
@@ -56,6 +65,8 @@ void AddTemporaryCredential(NSURL* url, NSString* realm,
     CBLManager* dbmgr;
     CBLDatabase* db;
 }
+
+@property (readonly) CBLDatabase* db;
 
 // Closes and re-opens 'db'.
 - (void) reopenTestDB;
@@ -96,13 +107,19 @@ void AddTemporaryCredential(NSURL* url, NSString* realm,
     The environment variable that controls this is CBL_SSL_TEST_SERVER. */
 - (NSURL*) remoteSSLTestDBURL: (NSString*)dbName;
 
+/** Never returns an HTTPS URL even if App Transport Security is present. */
+- (NSURL*) remoteNonSSLTestDBURL: (NSString*)dbName;
+
 /** A CBLAuthorizer to use when talking to the remote test server. */
 @property (readonly) id<CBLAuthorizer> authorizer;
 
 /** The self-signed cert(s) of the remote test server's SSL identity. */
 @property (readonly) NSArray* remoteTestDBAnchorCerts;
 
-/** Deletes a remote database. Works only with CouchDB, not Sync Gateway. */
+/** Sends an HTTP request via a CBLRemoteJSONRequest. Returns parsed JSON response. */
+- (id) sendRemoteRequest: (NSString*)method toURL: (NSURL*)url;
+
+/** Deletes a remote database. */
 - (void) eraseRemoteDB: (NSURL*)url;
 
 @end

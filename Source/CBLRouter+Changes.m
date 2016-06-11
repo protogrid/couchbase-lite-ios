@@ -16,6 +16,7 @@
 #import "CBL_Router.h"
 #import "CBLDatabase.h"
 #import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLMisc.h"
 
 
@@ -29,16 +30,39 @@ NSTimeInterval kMinHeartbeat = 5.0;
 @implementation CBL_Router (Changes)
 
 
+
+
+- (CBLStatus) do_POST_changes: (CBLDatabase*)db {
+    // Merge the properties from the JSON request body into the URL queries.
+    // Note that values in _queries have to be NSStrings or the parsing code will break!
+    NSMutableDictionary* queries = [self.queries mutableCopy] ?: [NSMutableDictionary new];
+    NSDictionary* body = self.bodyAsDictionary;
+    for (NSString* key in body) {
+        queries[key] = [CBLJSON stringWithJSONObject: body[key]
+                                             options: CBLJSONWritingAllowFragments
+                                               error: NULL];
+    }
+    _queries = [queries copy];
+
+    return [self doChanges: db];
+}
+
+
 - (CBLStatus) do_GET_changes: (CBLDatabase*)db {
-    // http://wiki.apache.org/couchdb/HTTP_database_API#Changes
-    
     [self parseChangesMode];
     // Regular poll is cacheable:
     if (_changesMode < kContinuousFeed)
         if ([self cacheWithEtag: $sprintf(@"%lld", _db.lastSequenceNumber)])
             return kCBLStatusNotModified;
+    return [self doChanges: db];
+}
 
+
+- (CBLStatus) doChanges: (CBLDatabase*)db {
+    // http://docs.couchdb.org/en/latest/api/database/changes.html
+    // http://wiki.apache.org/couchdb/HTTP_database_API#Changes
     // Get options:
+    [self parseChangesMode];
     CBLChangesOptions options = kDefaultCBLChangesOptions;
     _changesIncludeDocs = [self boolQuery: @"include_docs"];
     _changesIncludeConflicts = $equal([self query: @"style"], @"all_docs");
@@ -60,11 +84,11 @@ NSTimeInterval kMinHeartbeat = 5.0;
     NSString* filterName = [self query: @"filter"];
     if (filterName) {
         CBLStatus status;
-        _changesFilter = [_db compileFilterNamed: filterName status: &status];
+        _changesFilter = [_db loadFilterNamed: filterName status: &status];
         if (!_changesFilter)
             return status;
         _changesFilterParams = [self.queries copy];
-        LogTo(CBL_Router, @"Filter params=%@", _changesFilterParams);
+        LogTo(Router, @"Filter params=%@", _changesFilterParams);
     }
     
     CBLStatus status;
@@ -135,7 +159,7 @@ NSTimeInterval kMinHeartbeat = 5.0;
     for (CBL_Revision* rev in changes) {
         NSString* docID = rev.docID;
         if ($equal(docID, lastDocID)) {
-            [lastEntry[@"changes"] addObject: $dict({@"rev", rev.revID})];
+            [lastEntry[@"changes"] addObject: $dict({@"rev", rev.revIDString})];
         } else {
             lastEntry = [self changeDictForRev: rev];
             [entries addObject: lastEntry];
@@ -166,7 +190,7 @@ NSTimeInterval kMinHeartbeat = 5.0;
     }
     return $dict({@"seq", @(rev.sequence)},
                  {@"id",  rev.docID},
-                 {@"changes", $marray($dict({@"rev", rev.revID}))},
+                 {@"changes", $marray($dict({@"rev", rev.revIDString}))},
                  {@"deleted", rev.deleted ? $true : nil},
                  {@"doc", (_changesIncludeDocs ? rev.properties : nil)});
 }
@@ -179,7 +203,9 @@ NSTimeInterval kMinHeartbeat = 5.0;
     NSMutableArray* changes = $marray();
     for (CBLDatabaseChange* change in (n.userInfo)[@"changes"]) {
         CBL_Revision* rev = change.addedRevision;
-        NSString* winningRevID = change.winningRevisionID;
+        if (!rev)
+            continue; // ignore purges
+        CBL_RevID* winningRevID = change.winningRevisionID;
 
         if (!_changesIncludeConflicts) {
             if (!winningRevID)

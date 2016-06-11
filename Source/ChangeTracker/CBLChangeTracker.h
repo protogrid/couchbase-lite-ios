@@ -14,15 +14,18 @@
 //  and limitations under the License.
 
 #import <Foundation/Foundation.h>
-@class CBLChangeTracker;
-@class CBLCookieStorage;
+@class CBLChangeTracker, CBLCookieStorage, BLIPHTTPLogic;
 @protocol CBLAuthorizer;
+
+
+UsingLogDomain(ChangeTracker);
 
 
 @protocol CBLChangeTrackerClient <NSObject>
 - (BOOL) changeTrackerApproveSSLTrust: (SecTrustRef)serverTrust
                               forHost: (NSString*)host
                                  port: (UInt16)port;
+- (void) changeTrackerReceivedHTTPHeaders: (NSDictionary*)headers;
 - (void) changeTrackerReceivedSequence: (id)sequence
                                  docID: (NSString*)docID
                                 revIDs: (NSArray*)revIDs
@@ -63,6 +66,8 @@ typedef enum CBLChangeTrackerMode {
     CBLCookieStorage* _cookieStorage;
     unsigned _retryCount;
     BOOL _caughtUp;
+    BLIPHTTPLogic* _http;
+    BOOL _usePOST;
 }
 
 - (instancetype) initWithDatabaseURL: (NSURL*)databaseURL
@@ -77,13 +82,12 @@ typedef enum CBLChangeTrackerMode {
 @property (readonly, copy, nonatomic) id lastSequenceID;
 @property (nonatomic) BOOL continuous;  // If true, never give up due to errors
 @property (nonatomic) NSTimeInterval pollInterval;  // 0.0 to not poll
+@property (nonatomic) BOOL activeOnly;
 @property (strong, nonatomic) NSError* error;
 @property (weak, nonatomic) id<CBLChangeTrackerClient> client;
 @property (strong, nonatomic) NSDictionary *requestHeaders;
 @property (strong, nonatomic) id<CBLAuthorizer> authorizer;
 @property (strong, nonatomic) CBLCookieStorage* cookieStorage;
-
-@property (nonatomic) BOOL usePOST;
 
 @property (nonatomic) CBLChangeTrackerMode mode;
 @property (copy) NSString* filterName;
@@ -109,8 +113,10 @@ typedef enum CBLChangeTrackerMode {
 @property (readonly) NSDictionary* TLSSettings;
 - (BOOL) checkServerTrust: (SecTrustRef)sslTrust forURL: (NSURL*)url;
 - (void) retryAfterDelay: (NSTimeInterval)retryDelay;
-- (void) setUpstreamError: (NSString*)message;
 - (void) failedWithError: (NSError*)error;
+- (void) failedWithErrorDomain: (NSString*)domain
+                          code: (NSInteger)code
+                       message: (NSString*) message;
 - (void) stopped; // override this
 - (BOOL) parseBytes: (const void*)bytes length: (size_t)length;
 - (NSInteger) endParsingData;

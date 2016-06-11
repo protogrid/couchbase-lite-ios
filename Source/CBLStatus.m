@@ -44,7 +44,8 @@ static const struct StatusMapEntry kStatusMap[] = {
     {kCBLStatusBadJSON,              400, "Invalid JSON"},
     {kCBLStatusBadID,                400, "Invalid database/document/revision ID"},
     {kCBLStatusBadParam,             400, "Invalid parameter in HTTP query or JSON body"},
-    {kCBLStatusDeleted,              404, "deleted"},
+    {kCBLStatusDeleted,              404, "not_found"},
+    {kCBLStatusInvalidStorageType,   406, "Can't open database in that storage format"},
 
     {kCBLStatusUpstreamError,        502, "Invalid response from remote replication server"},
     {kCBLStatusBadChangesFeed,       502, "Server changes feed parse error"},
@@ -72,29 +73,29 @@ int CBLStatusToHTTPStatus( CBLStatus status, NSString** outMessage ) {
 }
 
 
-NSError* CBLStatusToNSErrorWithInfo( CBLStatus status, NSURL* url, NSDictionary* extraInfo ) {
-    NSString* reason;
-    status = CBLStatusToHTTPStatus(status, &reason);
-    NSMutableDictionary* info = $mdict({NSURLErrorKey, url},
+NSError* CBLStatusToNSErrorWithInfo( CBLStatus status, NSString *reason, NSURL* url,
+                                     NSDictionary* extraInfo ) {
+    NSString* statusMessage;
+    status = CBLStatusToHTTPStatus(status, &statusMessage);
+    reason = reason != nil ? reason : statusMessage;
+    NSMutableDictionary* info = $mdict({NSURLErrorFailingURLErrorKey, url},
                                        {NSLocalizedFailureReasonErrorKey, reason},
-                                       {NSLocalizedDescriptionKey, $sprintf(@"%i %@", status, reason)});
+                                       {NSLocalizedDescriptionKey, reason});
     if (extraInfo)
         [info addEntriesFromDictionary: extraInfo];
-    return [NSError errorWithDomain: CBLHTTPErrorDomain code: status userInfo: [info copy]];
+    return [NSError errorWithDomain: CBLHTTPErrorDomain code: status userInfo: info];
 }
 
 
-NSError* CBLStatusToNSError( CBLStatus status, NSURL* url ) {
-    return CBLStatusToNSErrorWithInfo(status, url, nil);
+NSError* CBLStatusToNSError( CBLStatus status ) {
+    return CBLStatusToNSErrorWithInfo(status, nil, nil, nil);
 }
 
 
-BOOL ReturnNSErrorFromCBLStatus( CBLStatus status, NSError** outError) {
-    if (!CBLStatusIsError(status))
-        return YES;
+BOOL CBLStatusToOutNSError(CBLStatus status, NSError** outError) {
     if (outError)
-        *outError = CBLStatusToNSError(status, nil);
-    return NO;
+        *outError = status < 300 ? nil : CBLStatusToNSError(status);
+    return !CBLStatusIsError(status);
 }
 
 

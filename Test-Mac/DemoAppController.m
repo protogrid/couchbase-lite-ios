@@ -15,11 +15,13 @@
 
 #import "DemoAppController.h"
 #import "DemoQuery.h"
+#import "ShoppingItem.h"
 #import "CBLJSON.h"
 #import "Test.h"
 #import "MYBlockUtils.h"
 
 #import <CouchbaseLite/CouchbaseLite.h>
+#import <CouchbaseLite/CBLRemoteLogging.h>
 #import <CouchbaseLiteListener/CBLListener.h>
 
 #undef FOR_TESTING_PURPOSES
@@ -30,10 +32,6 @@ static CBLListener* sListener;
 #endif
 
 
-@interface CBLListener (Testing)
-+ (void) runTestCases;
-@end
-
 #define ENABLE_REPLICATION
 
 
@@ -41,8 +39,6 @@ static CBLListener* sListener;
 
 
 int main (int argc, const char * argv[]) {
-    RunTestCases(argc,argv);
-    [CBLListener runTestCases];
     return NSApplicationMain(argc, argv);
 }
 
@@ -85,10 +81,12 @@ int main (int argc, const char * argv[]) {
         NSLog(@"FATAL: Please specify a CouchbaseLite database name in the app's Info.plist under the 'DemoDatabase' key");
         exit(1);
     }
+
+    [[CBLRemoteLogging sharedInstance] enableLogging: @[@"CBLDatabase", @"Query", @"Sync"]];
     
     NSError* error;
     _database = [[CBLManager sharedInstance] databaseNamed: dbName
-                                                                     error: &error];
+                                                     error: &error];
     if (!_database) {
         NSAssert(NO, @"Error creating db: %@", error);
     }
@@ -133,6 +131,12 @@ int main (int argc, const char * argv[]) {
     }];
 
 #endif
+}
+
+
+- (IBAction) addItem:(id)sender {
+    ShoppingItem* item = [ShoppingItem modelForNewDocumentInDatabase: _database];
+    [_tableController addObject: item];
 }
 
 
@@ -282,7 +286,7 @@ int main (int argc, const char * argv[]) {
 
 - (void) updateSyncStatusView {
 #ifdef ENABLE_REPLICATION
-    int value;
+    int value = 0;
     NSString* tooltip = nil;
     if (_pull.lastError) {
         value = 3;  // red
@@ -309,7 +313,7 @@ int main (int argc, const char * argv[]) {
             break;
         default:
             NSAssert(NO, @"Illegal mode");
-            break;
+            return;
     }
     _syncStatusView.intValue = value;
     _syncStatusView.toolTip = tooltip;

@@ -19,12 +19,19 @@
 #import "CBLRemoteRequest.h"
 #import "CBLAuthorizer.h"
 #import "CBLCookieStorage.h"
+#import "CBLMisc.h"
 #import "CBLStatus.h"
 #import "CBLBase64.h"
+#import "CBLGZip.h"
 #import "MYBlockUtils.h"
+#import "MYErrorUtils.h"
 #import "MYURLUtils.h"
-#import "WebSocketHTTPLogic.h"
+#import "BLIPHTTPLogic.h"
 #import <string.h>
+
+
+UsingLogDomain(SyncPerf);
+UsingLogDomain(Sync);
 
 
 #define kReadLength 4096u
@@ -32,11 +39,12 @@
 
 @implementation CBLSocketChangeTracker
 {
-    WebSocketHTTPLogic* _http;
     NSInputStream* _trackingInput;
     CFAbsoluteTime _startTime;
+    CBLGZip* _gzip;
     bool _gotResponseHeaders;
     bool _readyToRead;
+    NSString* _serverName;
 }
 
 - (BOOL) start {
@@ -48,45 +56,12 @@
 
     NSURL* url = self.changesFeedURL;
 
-    if (!_http) {
-        NSMutableURLRequest* urlRequest = [NSMutableURLRequest requestWithURL: url];
-        if (self.usePOST) {
-            urlRequest.HTTPMethod = @"POST";
-            urlRequest.HTTPBody = self.changesFeedPOSTBody;
-            [urlRequest setValue: @"application/json" forHTTPHeaderField: @"Content-Type"];
-        }
-
-        for (NSString* key in self.requestHeaders) {
-            if ([key caseInsensitiveCompare: @"Cookie"] == 0) {
-                urlRequest.HTTPShouldHandleCookies = NO;
-                break;
-            }
-        }
-
-        if (urlRequest.HTTPShouldHandleCookies) {
-            [self.cookieStorage addCookieHeaderToRequest: urlRequest];
-        }
-
-        _http = [[WebSocketHTTPLogic alloc] initWithURLRequest: urlRequest];
-
-        // Add headers from my .requestHeaders property:
-        [self.requestHeaders enumerateKeysAndObjectsUsingBlock: ^(id key, id value, BOOL *stop) {
-            _http[key] = value;
-        }];
-    }
-
     CFHTTPMessageRef request = [_http newHTTPRequest];
-
-    if (_authorizer && !_http.credential) {
-        // Let the Authorizer add its own credential:
-        NSString* authHeader = [_authorizer authorizeHTTPMessage: request forRealm: nil];
-        if (authHeader)
-            CFHTTPMessageSetHeaderFieldValue(request, CFSTR("Authorization"),
-                                             (__bridge CFStringRef)(authHeader));
-    }
+    CFHTTPMessageSetHeaderFieldValue(request, CFSTR("Accept-Encoding"), CFSTR("gzip"));
 
     // Now open the connection:
-    LogTo(SyncVerbose, @"%@: %@ %@", self, (self.usePOST ?@"POST" :@"GET"), url.resourceSpecifier);
+    LogTo(SyncPerf, @"%@: %@ %@", self, (_usePOST ?@"POST" :@"GET"), url.resourceSpecifier);
+    LogVerbose(Sync, @"%@: %@ %@", self, (_usePOST ?@"POST" :@"GET"), url.resourceSpecifier);
     CFReadStreamRef cfInputStream = CFReadStreamCreateForHTTPRequest(NULL, request);
     CFRelease(request);
     if (!cfInputStream)
@@ -110,6 +85,8 @@
 
     _gotResponseHeaders = false;
     _readyToRead = NO;
+    _gzip = nil;
+    _serverName = nil;
 
     _trackingInput = (NSInputStream*)CFBridgingRelease(cfInputStream);
     [_trackingInput setDelegate: self];
@@ -152,6 +129,13 @@
 
         trusted = [self checkServerTrust: sslTrust forURL: url];
         CFRelease(sslTrust);
+        if (!trusted) {
+            //TODO: This error could be made more precise
+            LogTo(ChangeTracker, @"%@: Untrustworthy SSL certificate", self);
+            [self failedWithErrorDomain: NSURLErrorDomain
+                                   code: NSURLErrorServerCertificateUntrusted
+                                message: @"Untrustworthy SSL certificate"];
+        }
     }
     return trusted;
 }
@@ -161,21 +145,38 @@
     CFHTTPMessageRef response;
     response = (CFHTTPMessageRef) CFReadStreamCopyProperty((CFReadStreamRef)_trackingInput,
                                                            kCFStreamPropertyHTTPResponseHeader);
-    Assert(response);
+    if (!response) {
+        [self failedWithErrorDomain: NSURLErrorDomain code: NSURLErrorNetworkConnectionLost
+                            message: @"Connection lost"];
+        return NO;
+    }
+    CFAutorelease(response);
     _gotResponseHeaders = true;
-    [_http receivedResponse: response];
-    CFRelease(response);
+    LogTo(SyncPerf, @"%@ got HTTP response headers (%ld) after %.3f sec",
+          self, CFHTTPMessageGetResponseStatusCode(response), CFAbsoluteTimeGetCurrent()-_startTime);
 
+    _serverName = CFBridgingRelease(CFHTTPMessageCopyHeaderFieldValue(response,
+                                                                      CFSTR("Server")));
+    NSString* encoding = CFBridgingRelease(CFHTTPMessageCopyHeaderFieldValue(response,
+                                                                    CFSTR("Content-Encoding")));
+    BOOL compressed = [encoding isEqualToString: @"gzip"];
+
+    [_http receivedResponse: response];
     if (_http.shouldContinue) {
         _retryCount = 0;
         _http = nil;
+        if (compressed)
+            _gzip = [[CBLGZip alloc] initForCompressing: NO];
+        NSDictionary* headers = CFBridgingRelease(CFHTTPMessageCopyAllHeaderFields(response));
+        [_client changeTrackerReceivedHTTPHeaders: headers];
         return YES;
     } else if (_http.shouldRetry) {
         [self clearConnection];
         [self retry];
         return NO;
     } else {
-        NSError* error = _http.error ?: CBLStatusToNSError(_http.httpStatus, _http.URL);
+        NSError* error = _http.error ?: CBLStatusToNSErrorWithInfo(_http.httpStatus,
+                                                                   nil, _http.URL, nil);
         [self failedWithError: error];
         return NO;
     }
@@ -194,24 +195,50 @@
 #pragma mark - STREAM HANDLING:
 
 
+- (BOOL) readGzippedBytes: (const void*)bytes length: (size_t)length {
+    __weak CBLSocketChangeTracker* weakSelf = self;
+    BOOL ok = [_gzip addBytes: bytes
+                       length: length
+                     onOutput: ^(const void *decompressedBytes, size_t decompressedLength) {
+        [weakSelf parseBytes: decompressedBytes length: decompressedLength];
+    }];
+    if (!ok) {
+        [self failedWithErrorDomain: @"zlib" code:_gzip.status
+                            message: @"Invalid gzipped response data"];
+    }
+    return ok;
+}
+
+
 - (void) readFromInput {
     Assert(_readyToRead);
     _readyToRead = false;
     uint8_t buffer[kReadLength];
-    NSInteger bytesRead = [_trackingInput read: buffer maxLength: sizeof(buffer)];
-    if (bytesRead > 0)
-        [self parseBytes: buffer length: bytesRead];
+    while (_trackingInput.hasBytesAvailable) {
+        NSInteger bytesRead = [_trackingInput read: buffer maxLength: sizeof(buffer)];
+        if (bytesRead > 0) {
+            if (_gzip)
+                [self readGzippedBytes: buffer length: bytesRead];
+            else
+                [self parseBytes: buffer length: bytesRead];
+        }
+    }
 }
 
 
 - (void) handleEOF {
     if (!_gotResponseHeaders) {
-        [self failedWithError: [NSError errorWithDomain: NSURLErrorDomain
-                                                   code: NSURLErrorNetworkConnectionLost
-                                               userInfo: nil]];
-        return;
+        [self readResponseHeader];
+        if (!_gotResponseHeaders)
+            return;
     }
-    if (_mode == kContinuous) {
+    self.paused = NO;   // parse any incoming bytes that have been waiting
+    if (_gzip) {
+        [self readGzippedBytes: NULL length: 0]; // flush gzip decoder
+        _gzip = nil;
+    }
+    LogTo(SyncPerf, @"%@ reached EOF after %.3f sec", self, CFAbsoluteTimeGetCurrent()-_startTime);
+    if (_mode == kContinuous || _error) {
         [self stop];
     } else if ([self endParsingData] >= 0) {
         // Successfully reached end.
@@ -235,9 +262,8 @@
     } else {
         // JSON must have been truncated, probably due to socket being closed early.
         if (_mode == kOneShot) {
-            [self failedWithError: [NSError errorWithDomain: NSURLErrorDomain
-                                                       code: NSURLErrorNetworkConnectionLost
-                                                   userInfo: nil]];
+            [self failedWithErrorDomain: NSURLErrorDomain code: NSURLErrorNetworkConnectionLost
+                                message: @"Truncated response received"];
             return;
         }
         NSTimeInterval elapsed = CFAbsoluteTimeGetCurrent() - _startTime;
@@ -252,9 +278,8 @@
         } else {
             // Response data was truncated. This has been reported as an intermittent error
             // (see TouchDB issue #241). Treat it as if it were a socket error -- i.e. pause/retry.
-            [self failedWithError: [NSError errorWithDomain: NSURLErrorDomain
-                                                       code: NSURLErrorNetworkConnectionLost
-                                                   userInfo: nil]];
+            [self failedWithErrorDomain: NSURLErrorDomain code: NSURLErrorNetworkConnectionLost
+                                                 message: @"Truncated response received"];
         }
     }
 }
@@ -262,7 +287,32 @@
 
 - (void) failedWithError:(NSError*) error {
     [self clearConnection];
+
+    // Work around some servers' lack of support of POST to _changes. A 405 (Method Not Allowed) is
+    // a dead giveaway, but there are some Cloudant-specific errors too.
+    if (_usePOST) {
+        if ([error my_hasDomain: CBLHTTPErrorDomain code: kCBLStatusMethodNotAllowed]
+            || [self isCloudantAuthError: error]) {
+                LogTo(ChangeTracker, @"Retrying with a GET after error %@...",
+                      error.my_compactDescription);
+                _usePOST = NO;
+                _http = nil;
+                [self retryAfterDelay: 0.0];
+                return;
+            }
+    }
+
     [super failedWithError: error];
+}
+
+
+// Cloudant returns 401 or 403 if we send it a POST to _changes for a write-protected database.
+// (See issues #1020, #1267.)
+- (BOOL) isCloudantAuthError: (NSError*)error {
+    if ([_serverName rangeOfString: @"CouchDB/1.0.2"].length == 0)     // (Accurate as of 5/2016)
+        return NO;
+    return [error my_hasDomain: NSURLErrorDomain code: NSURLErrorUserAuthenticationRequired]
+        || [error my_hasDomain: CBLHTTPErrorDomain code: kCBLStatusForbidden];
 }
 
 
@@ -270,7 +320,7 @@
     __unused id keepMeAround = self; // retain myself so I can't be dealloced during this method
     switch (eventCode) {
         case NSStreamEventHasBytesAvailable: {
-            LogTo(ChangeTrackerVerbose, @"%@: HasBytesAvailable %@", self, stream);
+            LogVerbose(ChangeTracker, @"%@: HasBytesAvailable %@", self, stream);
             if (!_gotResponseHeaders) {
                 if (![self checkSSLCert] || ![self readResponseHeader])
                     return;

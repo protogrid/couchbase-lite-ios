@@ -16,7 +16,7 @@
 #import "CBLDatabase+Insertion.h"
 #import "CBLDatabase+Attachments.h"
 #import "CBLDatabase.h"
-#import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLDocument.h"
 #import "CBL_Revision.h"
 #import "CBL_Attachment.h"
@@ -28,26 +28,14 @@
 #import "ExceptionUtils.h"
 
 
-#ifdef GNUSTEP
-#import <openssl/sha.h>
-#else
-#define COMMON_DIGEST_FOR_OPENSSL
-#import <CommonCrypto/CommonDigest.h>
-#endif
+DefineLogDomain(Validation);
 
 
 @interface CBLValidationContext : NSObject <CBLValidationContext>
-{
-    @private
-    CBLDatabase* _db;
-    CBL_Revision* _currentRevision, *_newRevision;
-    int _errorType;
-    NSString* _errorMessage;
-    NSArray* _changedKeys;
-}
 - (instancetype) initWithDatabase: (CBLDatabase*)db
                          revision: (CBL_Revision*)currentRevision
-                      newRevision: (CBL_Revision*)newRevision;
+                      newRevision: (CBL_Revision*)newRevision
+                           source: (NSURL*)source;
 @property (readonly) CBLSavedRevision* currentRevision;
 @property (readonly) NSString* rejectionMessage;
 @end
@@ -77,175 +65,164 @@
 }
 
 
-/** Given an existing revision ID, generates an ID for the next revision.
-    Returns nil if prevID is invalid. */
-- (NSString*) _generateRevIDForJSON: (NSData*)json
-                           deleted: (BOOL)deleted
-                         prevRevID: (NSString*) prevID
-{
-    // Revision IDs have a generation count, a hyphen, and a hex digest.
-    unsigned generation = 0;
-    if (prevID) {
-        generation = [CBL_Revision generationFromRevID: prevID];
-        if (generation == 0)
-            return nil;
-    }
-    
-    // Generate a digest for this revision based on the previous revision ID, document JSON,
-    // and attachment digests. This doesn't need to be secure; we just need to ensure that this
-    // code consistently generates the same ID given equivalent revisions.
-    __block MD5_CTX ctx;
-    unsigned char digestBytes[MD5_DIGEST_LENGTH];
-    MD5_Init(&ctx);
-
-    __block BOOL tooLong = NO;
-    CBLWithStringBytes(prevID, ^(const char *bytes, size_t length) {
-        if (length > 0xFF)
-            tooLong = YES;
-        uint8_t lengthByte = length & 0xFF;
-        MD5_Update(&ctx, &lengthByte, 1);       // prefix with length byte
-        if (length > 0)
-            MD5_Update(&ctx, bytes, length);
-    });
-    
-    uint8_t deletedByte = deleted != NO;
-    MD5_Update(&ctx, &deletedByte, 1);
-    
-    MD5_Update(&ctx, json.bytes, json.length);
-    MD5_Final(digestBytes, &ctx);
-
-    char hex[11 + 2*MD5_DIGEST_LENGTH + 1];
-    char *dst = hex + sprintf(hex, "%u-", generation+1);
-    dst = CBLAppendHex(dst, digestBytes, sizeof(digestBytes));
-    return [[NSString alloc] initWithBytes: hex
-                                    length: dst - hex
-                                  encoding: NSASCIIStringEncoding];
-}
-
-
 /** Extracts the history of revision IDs (in reverse chronological order) from the _revisions key */
-+ (NSArray*) parseCouchDBRevisionHistory: (NSDictionary*)docProperties {
-    NSDictionary* revisions = $castIf(NSDictionary,
-                                      docProperties[@"_revisions"]);
-    if (!revisions)
-        return nil;
-    // Extract the history, expanding the numeric prefixes:
-    NSArray* revIDs = $castIf(NSArray, revisions[@"ids"]);
-    __block int start = [$castIf(NSNumber, revisions[@"start"]) intValue];
-    if (start)
-        revIDs = [revIDs my_map: ^(id revID) {return $sprintf(@"%d-%@", start--, revID);}];
-    return revIDs;
++ (NSArray<CBL_RevID*>*) parseCouchDBRevisionHistory: (NSDictionary*)docProperties {
+    return [CBL_TreeRevID parseRevisionHistoryDict: $castIf(NSDictionary,
+                                                            docProperties[@"_revisions"])];
 }
 
 
 #pragma mark - INSERTION:
 
 
+#if DEBUG // for tests only
 - (CBL_Revision*) putRevision: (CBL_MutableRevision*)putRev
-               prevRevisionID: (NSString*)inPrevRevID
+               prevRevisionID: (CBL_RevID*)inPrevRevID
                 allowConflict: (BOOL)allowConflict
                        status: (CBLStatus*)outStatus
+                        error: (NSError**)outError
 {
     return [self putDocID: putRev.docID properties: [putRev.properties mutableCopy]
-           prevRevisionID: inPrevRevID allowConflict: allowConflict status: outStatus];
+           prevRevisionID: inPrevRevID allowConflict: allowConflict
+                   source: nil
+                   status: outStatus error: outError];
 }
+#endif
 
 
 - (CBL_Revision*) putDocID: (NSString*)inDocID
                 properties: (NSMutableDictionary*)properties
-            prevRevisionID: (NSString*)inPrevRevID
+            prevRevisionID: (CBL_RevID*)inPrevRevID
              allowConflict: (BOOL)allowConflict
+                    source: (NSURL*)source
                     status: (CBLStatus*)outStatus
+                     error: (NSError**)outError
 {
     Assert(outStatus);
     __block NSString* docID = inDocID;
-    __block NSString* prevRevID = inPrevRevID;
+    __block CBL_RevID* prevRevID = inPrevRevID;
     BOOL deleting = !properties || properties.cbl_deleted;
-    LogTo(CBLDatabase, @"PUT _id=%@, _rev=%@, _deleted=%d, allowConflict=%d",
-          docID, prevRevID, deleting, allowConflict);
+    LogTo(Database, @"%@ _id=%@, _rev=%@ (allowConflict=%d)",
+          (deleting ? @"DELETE" : @"PUT"), docID, prevRevID, allowConflict);
     if ((prevRevID && !docID) || (deleting && !docID)
             || (docID && ![CBLDatabase isValidDocumentID: docID])) {
         *outStatus = kCBLStatusBadID;
+        CBLStatusToOutNSError(*outStatus, outError);
         return nil;
     }
 
     if (properties.cbl_attachments) {
         // Add any new attachment data to the blob-store, and turn all of them into stubs:
         //FIX: Optimize this to avoid creating a revision object
-        CBL_MutableRevision* tmpRev = [[CBL_MutableRevision alloc] initWithDocID: docID
-                                                                           revID: prevRevID
+        CBL_RevID* tmpRevID = $sprintf(@"%d-00", prevRevID.generation + 1).cbl_asRevID;
+        CBL_MutableRevision* tmpRev = [[CBL_MutableRevision alloc] initWithDocID: (docID ?: @"x")
+                                                                           revID: tmpRevID
                                                                          deleted: deleting];
         tmpRev.properties = properties;
         if (![self processAttachmentsForRevision: tmpRev
-                                       prevRevID: prevRevID
-                                          status: outStatus])
+                                        ancestry: (prevRevID ? @[prevRevID] : nil)
+                                          status: outStatus]) {
+            CBLStatusToOutNSError(*outStatus, outError);
             return nil;
+        }
         properties = [tmpRev.properties mutableCopy];
     }
 
     CBL_StorageValidationBlock validationBlock = nil;
     if ([self.shared hasValuesOfType: @"validation" inDatabaseNamed: _name]) {
-        validationBlock = ^(CBL_Revision* rev, CBL_Revision* prev, NSString* parentRevID) {
+        validationBlock = ^(CBL_Revision* rev, CBL_Revision* prev, CBL_RevID* parentRevID, NSError** outError) {
             return [self validateRevision: rev
                          previousRevision: prev
-                              parentRevID: parentRevID];
+                              parentRevID: parentRevID
+                                   source: nil
+                                    error: outError];
         };
     }
 
-    CBL_Revision* putRev = [_storage addDocID: inDocID
-                                    prevRevID: inPrevRevID
-                                   properties: properties
-                                     deleting: deleting
-                                allowConflict: allowConflict
-                              validationBlock: validationBlock
-                                       status: outStatus];
-    if (putRev) {
-        LogTo(CBLDatabase, @"--> created %@", putRev);
-    }
-    return putRev;
+    return [_storage addDocID: inDocID
+                    prevRevID: inPrevRevID
+                   properties: properties
+                     deleting: deleting
+                allowConflict: allowConflict
+              validationBlock: validationBlock
+                       status: outStatus
+                        error: outError];
 }
 
 
 /** Add an existing revision of a document (probably being pulled) plus its ancestors. */
 - (CBLStatus) forceInsert: (CBL_Revision*)inRev
-          revisionHistory: (NSArray*)history  // in *reverse* order, starting with rev's revID
+          revisionHistory: (NSArray<CBL_RevID*>*)history  // in *reverse* order, starting with rev's revID
                    source: (NSURL*)source
+                    error: (NSError**)outError
 {
+    LogTo(Database, @"INSERT %@, history[%lu]", inRev, (unsigned long)history.count);
+    AssertContainsRevIDs(history);
     CBL_MutableRevision* rev = inRev.mutableCopy;
     rev.sequence = 0;
-    NSString* revID = rev.revID;
-    if (![CBLDatabase isValidDocumentID: rev.docID] || !revID)
+    CBL_RevID* revID = rev.revID;
+    if (![CBLDatabase isValidDocumentID: rev.docID] || !revID) {
+        CBLStatusToOutNSError(kCBLStatusBadID, outError);
         return kCBLStatusBadID;
+    }
     
     if (history.count == 0)
         history = @[revID];
-    else if (!$equal(history[0], revID))
-        return kCBLStatusBadID;
+    else if (!$equal(history[0], revID)) {
+        // If inRev's revID doesn't appear in history, add it at the start:
+        NSMutableArray* nuHistory = [history mutableCopy];
+        [nuHistory insertObject: revID atIndex: 0];
+        history = nuHistory;
+    }
 
     CBLStatus status;
     if (inRev.attachments) {
         CBL_MutableRevision* updatedRev = [inRev mutableCopy];
-        NSString* prevRevID = history.count >= 2 ? history[1] : nil;
+        NSArray* ancestry = [history subarrayWithRange: NSMakeRange(1, history.count-1)];
         if (![self processAttachmentsForRevision: updatedRev
-                                       prevRevID: prevRevID
-                                          status: &status])
+                                        ancestry: ancestry
+                                          status: &status]) {
+            CBLStatusToOutNSError(status, outError);
             return status;
+        }
         inRev = updatedRev;
     }
 
     CBL_StorageValidationBlock validationBlock = nil;
     if ([self.shared hasValuesOfType: @"validation" inDatabaseNamed: _name]) {
-        validationBlock = ^(CBL_Revision* newRev, CBL_Revision* prev, NSString* parentRevID) {
+        validationBlock = ^(CBL_Revision* newRev, CBL_Revision* prev, CBL_RevID* parentRevID,
+                            NSError** outError) {
             return [self validateRevision: newRev
                          previousRevision: prev
-                              parentRevID: parentRevID];
+                              parentRevID: parentRevID
+                                   source: source
+                                    error: outError];
         };
     }
 
     return [_storage forceInsert: inRev
                  revisionHistory: history
                  validationBlock: validationBlock
-                          source: source];
+                          source: source
+                           error: outError];
+}
+
+
+- (BOOL) forceInsertRevisionWithJSON: (NSData*)json
+                     revisionHistory: (NSArray*)history
+                              source: (NSURL*)source
+                               error: (NSError**)outError
+{
+    CBL_Body* body = [CBL_Body bodyWithJSON: json];
+    if (body) {
+        CBL_Revision* rev = [[CBL_Revision alloc] initWithBody: body];
+        if (rev) {
+            CBLStatus status = [self forceInsert: rev revisionHistory: history source: source
+                                           error: outError];
+            return !CBLStatusIsError(status);
+        }
+    }
+    return CBLStatusToOutNSError(kCBLStatusBadJSON, outError);
 }
 
 
@@ -254,8 +231,13 @@
 
 - (CBLStatus) validateRevision: (CBL_Revision*)newRev
               previousRevision: (CBL_Revision*)oldRev
-                   parentRevID: (NSString*)parentRevID
+                   parentRevID: (CBL_RevID*)parentRevID
+                        source: (NSURL*)source
+                         error: (NSError**)outError
 {
+    if (outError)
+        *outError = nil;
+    
     NSDictionary* validations = [self.shared valuesOfType: @"validation" inDatabaseNamed: _name];
     if (validations.count == 0)
         return kCBLStatusOK;
@@ -264,8 +246,9 @@
                                                                revision: newRev
                                                        parentRevisionID: parentRevID];
     CBLValidationContext* context = [[CBLValidationContext alloc] initWithDatabase: self
-                                                                        revision: oldRev
-                                                                     newRevision: newRev];
+                                                                          revision: oldRev
+                                                                       newRevision: newRev
+                                                                            source: source];
     CBLStatus status = kCBLStatusOK;
     for (NSString* validationName in validations) {
         CBLValidationBlock validation = [self validationNamed: validationName];
@@ -274,15 +257,19 @@
         } @catch (NSException* x) {
             MYReportException(x, @"validation block '%@'", validationName);
             status = kCBLStatusCallbackError;
+            CBLStatusToOutNSError(status, outError);
             break;
         }
         if (context.rejectionMessage != nil) {
-            LogTo(CBLValidation, @"Failed update of %@: %@:\n  Old doc = %@\n  New doc = %@",
+            LogTo(Validation, @"Failed update of %@: %@:\n  Old doc = %@\n  New doc = %@",
                   oldRev, context.rejectionMessage, oldRev.properties, newRev.properties);
             status = kCBLStatusForbidden;
+            if (outError)
+                *outError = CBLStatusToNSErrorWithInfo(status, context.rejectionMessage, nil, nil);
             break;
         }
     }
+    
     return status;
 }
 
@@ -295,16 +282,27 @@
 
 
 @implementation CBLValidationContext
+{
+@private
+    CBLDatabase* _db;
+    CBL_Revision* _currentRevision, *_newRevision;
+    NSURL* _source;
+    int _errorType;
+    NSString* _errorMessage;
+    NSArray* _changedKeys;
+}
 
 - (instancetype) initWithDatabase: (CBLDatabase*)db
                          revision: (CBL_Revision*)currentRevision
                       newRevision: (CBL_Revision*)newRevision
+                           source: (NSURL*)source
 {
     self = [super init];
     if (self) {
         _db = db;
         _currentRevision = currentRevision;
         _newRevision = newRevision;
+        _source = source;
         _errorType = kCBLStatusForbidden;
         _errorMessage = @"invalid document";
     }
@@ -312,12 +310,13 @@
 }
 
 
-@synthesize rejectionMessage=_rejectionMessage;
+@synthesize rejectionMessage=_rejectionMessage, source=_source;
 
 
 - (CBL_Revision*) current_Revision {
+    CBLStatus status;
     if (_currentRevision)
-        _currentRevision = [_db revisionByLoadingBody: _currentRevision status: NULL];
+        _currentRevision = [_db revisionByLoadingBody: _currentRevision status: &status];
     return _currentRevision;
 }
 

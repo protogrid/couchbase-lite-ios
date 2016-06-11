@@ -22,6 +22,9 @@
 #import <sqlite3.h>
 
 
+DefineLogDomain(Upgrade);
+
+
 @implementation CBLDatabaseUpgrade
 {
     CBLDatabase* _db;
@@ -77,7 +80,7 @@ static int collateRevIDs(void *context,
     // Open destination database:
     NSError* error;
     if (![_db open: &error]) {
-        Warn(@"Upgrade failed: Couldn't open new db: %@", error);
+        Warn(@"Upgrade failed: Couldn't open new db: %@", error.my_compactDescription);
         return CBLStatusFromNSError(error, 0);
     }
 
@@ -138,6 +141,14 @@ static int collateRevIDs(void *context,
 }
 
 
+- (void) deleteSQLiteFiles {
+    for (NSString* suffix in @[@"", @"-wal", @"-shm"]) {
+        NSString* oldFile = [_path stringByAppendingString: suffix];
+        [[NSFileManager defaultManager] removeItemAtPath: oldFile error: NULL];
+    }
+}
+
+
 - (CBLStatus) moveAttachmentsDir {
     NSFileManager* fmgr = [NSFileManager defaultManager];
     NSString* oldAttachmentsPath = [[_path stringByDeletingPathExtension]
@@ -159,11 +170,67 @@ static int collateRevIDs(void *context,
     }
     if (!result) {
         if (!CBLIsFileNotFoundError(error)) {
-            Warn(@"Upgrade failed: Couldn't move attachments: %@", error);
+            Warn(@"Upgrade failed: Couldn't move attachments: %@", error.my_compactDescription);
             return CBLStatusFromNSError(error, 0);
         }
     }
-    return kCBLStatusOK;
+
+    return [self renameAttachmentFileNamesInDir: newAttachmentsPath];
+}
+
+
+- (CBLStatus) renameAttachmentFileNamesInDir: (NSString*)dir {
+    // CBL Android 1.0.4 and .NET 1.1.0 have lowercase attachment file names.
+    // This method will detect that and uppercase the file names if needed.
+    NSFileManager* fmgr = [NSFileManager defaultManager];
+
+    if (![fmgr fileExistsAtPath: dir])
+        return kCBLStatusOK;
+
+    NSError* error;
+    NSArray* content = [fmgr contentsOfDirectoryAtPath: dir error: &error];
+    if (error)
+        return CBLStatusFromNSError(error, kCBLStatusAttachmentError);
+
+    BOOL success = YES;
+    NSMutableDictionary* renDict = [NSMutableDictionary dictionary];
+    for (NSString* oldFileName in content) {
+        if (![[oldFileName pathExtension] isEqualToString:@"blob"])
+            continue;
+        
+        NSString* newFileName = [[[oldFileName stringByDeletingPathExtension] uppercaseString]
+                                    stringByAppendingPathExtension: @"blob"];
+        // Assume no both lowercase and uppercase filename mixed.
+        // Skip the renaming process if detecting that the file name is already uppercase:
+        if ([newFileName isEqualToString: oldFileName])
+            break;
+        
+        NSString* oldPath = [dir stringByAppendingPathComponent: oldFileName];
+        NSString* newPath = [dir stringByAppendingPathComponent: newFileName];
+        if ([fmgr moveItemAtPath: oldPath toPath: newPath error: &error]) {
+            [renDict setObject: newFileName forKey: oldFileName];
+        } else {
+            Warn(@"Upgrade failed: Cannot rename attachment file from %@ to %@: %@",
+                 oldPath, newPath, error.my_compactDescription);
+            success = NO;
+            break;
+        }
+    }
+    
+    if (!success && [renDict count] > 0) {
+        // Backing out if there is an error found:
+        for (NSString *oldFileName in [renDict allKeys]) {
+            NSString* oldPath = [dir stringByAppendingPathComponent: oldFileName];
+            NSString* newPath = [dir stringByAppendingPathComponent: [renDict objectForKey: oldFileName]];
+            NSError* error;
+            if (![fmgr moveItemAtPath: newPath toPath: oldPath error: &error]) {
+                Warn(@"Upgrade failed: Cannot back out renaming attachment file from %@ to %@: %@",
+                     newPath, oldPath, error.my_compactDescription);
+            }
+        }
+    }
+
+    return success ? kCBLStatusOK : (CBLStatusFromNSError(error, kCBLStatusAttachmentError));
 }
 
 
@@ -198,10 +265,10 @@ static int collateRevIDs(void *context,
     while (SQLITE_ROW == (err = sqlite3_step(_revQuery))) {
         @autoreleasepool {
             int64_t sequence = sqlite3_column_int64(_revQuery, 0);
-            NSString* revID = columnString(_revQuery, 1);
+            CBL_RevID* revID = columnString(_revQuery, 1).cbl_asRevID;
             int64_t parentSeq = sqlite3_column_int64(_revQuery, 2);
             BOOL current = (BOOL)sqlite3_column_int(_revQuery, 3);
-            BOOL noAtts = (BOOL)sqlite3_column_int(_revQuery, 4);
+            BOOL noAtts = (BOOL)sqlite3_column_int(_revQuery, 6);
 
             if (current) {
                 // Add a leaf revision:
@@ -234,7 +301,7 @@ static int collateRevIDs(void *context,
                 }
 
                 LogTo(Upgrade, @"Upgrading doc %@, history = %@", rev, history);
-                status = [_db forceInsert: rev revisionHistory: history source: nil];
+                status = [_db forceInsert: rev revisionHistory: history source: nil error: nil];
                 if (CBLStatusIsError(status))
                     return status;
                 ++_numRevs;
@@ -254,7 +321,7 @@ static int collateRevIDs(void *context,
                                                       options: NSJSONReadingMutableContainers
                                                         error: &error];
     if (!object) {
-        Warn(@"Unable to parse the json data : %@", error);
+        Warn(@"Unable to parse the json data : %@", error.my_compactDescription);
         return kCBLStatusBadJSON;
     }
 
@@ -266,7 +333,7 @@ static int collateRevIDs(void *context,
 
     NSData *nuJson = [CBLJSON dataWithJSONObject: object options: 0 error: &error];
     if (!nuJson) {
-        Warn(@"Unable to serialize the json object : %@", error);
+        Warn(@"Unable to serialize the json object : %@", error.my_compactDescription);
         return kCBLStatusBadJSON;
     }
     [json setData: nuJson];
@@ -367,12 +434,15 @@ static int collateRevIDs(void *context,
     while (SQLITE_ROW == (err = sqlite3_step(localQuery))) {
         @autoreleasepool {
             NSString* docID = columnString(localQuery, 0);
+            // Remove "_local/" prefix:
+            if ([docID hasPrefix:@"_local/"])
+                docID = [docID substringFromIndex:7];
             NSData* json = columnData(localQuery, 1);
             NSDictionary* props = [CBLJSON JSONObjectWithData: json options: 0 error: NULL];
             LogTo(Upgrade, @"Upgrading local doc '%@'", docID);
             NSError* error;
             if (props && ![_db putLocalDocument: props withID: docID error: &error]) {
-                Warn(@"Couldn't import local doc '%@': %@", docID, error);
+                Warn(@"Couldn't import local doc '%@': %@", docID, error.my_compactDescription);
             }
         }
     }

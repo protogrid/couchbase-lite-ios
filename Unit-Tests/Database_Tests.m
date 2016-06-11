@@ -7,6 +7,7 @@
 //
 
 #import "CBLTestCase.h"
+#import "CBLInternal.h"
 
 
 @interface Database_Tests : CBLTestCaseWithDB
@@ -25,19 +26,59 @@
     Assert(founddb, @"Couldn't get/create test_db: %@", error);
     AssertEq(founddb, db);
 
-    CBLManagerOptions options = {.readOnly= true};
-    CBLManager* ro = [[CBLManager alloc] initWithDirectory: dbmgr.directory options: &options
-                                                     error: &error];
-    Assert(ro);
+    // openDatabaseNamed:withOptions: returns existing Database object
+    CBLDatabaseOptions* dbOptions = [CBLDatabaseOptions new];
+    founddb = [dbmgr openDatabaseNamed: dbName withOptions: dbOptions error: &error];
+    AssertEq(founddb, db);
 
-    db = [ro databaseNamed: @"foo" error: &error];
-    AssertNil(db);
+    // Can't create a readOnly database
+    dbOptions.readOnly = YES;
+    founddb = [dbmgr openDatabaseNamed: @"foo" withOptions: dbOptions error: &error];
+    AssertNil(founddb);
 
-    db = [ro existingDatabaseNamed: dbName error: &error];
-    Assert(db);
-    CBLDocument* doc = [db createDocument];
-    Assert(![doc putProperties: @{@"foo": @"bar"} error: &error]);
-    [ro close];
+    // Open a read-only manager on the same directory:
+    {
+        CBLManagerOptions options = {.readOnly= true};
+        CBLManager* ro = [[CBLManager alloc] initWithDirectory: dbmgr.directory options: &options
+                                                         error: &error];
+        Assert(ro);
+
+        // Read-only Manager can't create a database:
+        CBLDatabase *rodb = [ro databaseNamed: @"foo" error: &error];
+        AssertNil(rodb);
+
+        // ...even if db is opened without the readOnly flag
+        dbOptions.readOnly = NO;
+        rodb = [dbmgr openDatabaseNamed: @"foo" withOptions: dbOptions error: &error];
+        AssertNil(rodb);
+
+        // ...but it can open an existing one:
+        rodb = [ro existingDatabaseNamed: dbName error: &error];
+        Assert(rodb);
+        // ...but can't create a document:
+        CBLDocument* doc = [rodb createDocument];
+        Assert(![doc putProperties: @{@"foo": @"bar"} error: &error]);
+
+        Assert(![rodb compact: &error]);
+        Assert(![rodb deleteDatabase: &error]);
+
+        [ro close];
+    }
+
+    {
+        // Open a second read/write Manager
+        CBLManager* otherMgr = [[CBLManager alloc] initWithDirectory: dbmgr.directory options: NULL
+                                                         error: &error];
+        // Open a read-only database:
+        dbOptions.readOnly = YES;
+        CBLDatabase *rodb = [otherMgr openDatabaseNamed: dbName withOptions: dbOptions error: &error];
+        Assert(rodb);
+        // Make sure it can't create a document:
+        CBLDocument *doc = [rodb createDocument];
+        Assert(![doc putProperties: @{@"foo": @"bar"} error: &error]);
+        AssertEq(error.code, kCBLStatusForbidden);
+        [otherMgr close];
+    }
 }
 
 
@@ -79,8 +120,7 @@
     error = nil;
     CBLManager* copiedMgr = [dbmgr copy];
     CBLDatabase* localdb = [copiedMgr databaseNamed: dbName error: &error];
-    Assert(!error);
-    Assert(localdb);
+    Assert(localdb, @"Couldn't open db: %@", error);
 
     // Get the database from the shared manager and delete
     error = nil;
@@ -88,8 +128,7 @@
     // Close the copied manager before deleting the database
     [copiedMgr close];
     result = [localdb deleteDatabase: &error];
-    Assert(!error);
-    Assert(result);
+    Assert(result, @"Couldn't delete db: %@", error);
 
     // Check if the database still exists or not
     error = nil;
@@ -106,16 +145,14 @@
     dispatch_sync(queue, ^{
         NSError *error;
         copiedMgrDb = [copiedMgr databaseNamed: dbName error: &error];
-        Assert(!error);
-        Assert(copiedMgrDb);
+        Assert(copiedMgrDb, @"Couldn't open db: %@", error);
     });
 
     // Get the database from the shared manager and delete
     error = nil;
     localdb = [dbmgr databaseNamed: dbName error: &error];
     result = [localdb deleteDatabase: &error];
-    Assert(!error);
-    Assert(result);
+    Assert(result, @"Couldn't delete db: %@", error);
 
     // Cleanup
     dispatch_sync(queue, ^{
@@ -291,7 +328,7 @@
 
     // Add a deletion/tombstone revision:
     newRev = doc.newRevision;
-    AssertEq(newRev.parentRevisionID, rev2.revisionID);
+    AssertEqual(newRev.parentRevisionID, rev2.revisionID);
     AssertEqual(newRev.parentRevision, rev2);
     newRev.isDeletion = true;
     CBLSavedRevision* rev3 = [newRev save: &error];
@@ -305,6 +342,78 @@
     AssertEqual([doc getLeafRevisions: &error], @[rev3]);
     CBLDocument* doc2 = db[doc.documentID];
     AssertEq(doc2, doc);
+}
+
+
+- (void) test071_PutExistingRevision {
+    CBLDocument* doc = [self createDocumentWithProperties: @{@"foo": @1}];
+
+    NSError* error;
+    Assert(([doc putExistingRevisionWithProperties: @{@"foo": @2}
+                                       attachments: nil
+                                   revisionHistory: @[@"3-cafebabe", @"2-feedba95", doc.currentRevisionID]
+                                           fromURL: nil
+                                             error: &error]));
+    CBLRevision* rev = [doc revisionWithID: @"3-cafebabe"];
+    Assert(rev);
+    Assert(!rev.isDeletion);
+    AssertEqual(rev.properties, (@{@"_id": doc.documentID,
+                                   @"_rev": @"3-cafebabe",
+                                   @"foo": @2}));
+
+    // Repeat; should be no error:
+    Assert(([doc putExistingRevisionWithProperties: @{@"foo": @2}
+                                       attachments: nil
+                                   revisionHistory: @[@"3-cafebabe", @"2-feedba95", doc.currentRevisionID]
+                                           fromURL: nil
+                                             error: &error]));
+
+    // Add a deleted revision:
+    Assert(([doc putExistingRevisionWithProperties: @{@"foo": @-1, @"_deleted": @YES}
+                                       attachments: nil
+                                   revisionHistory: @[@"3-deadbeef", @"2-feedba95", doc.currentRevisionID]
+                                           fromURL: nil
+                                             error: &error]));
+    rev = [doc revisionWithID: @"3-deadbeef"];
+    Assert(rev);
+    Assert(rev.isDeletion);
+    AssertEqual(rev.properties, (@{@"_id": doc.documentID,
+                                   @"_rev": @"3-deadbeef",
+                                   @"_deleted": @YES,
+                                   @"foo": @-1}));
+}
+
+
+- (void) test072_PutExistingRevisionWithAttachment {
+    CBLDocument* doc = db[@"some-doc"];
+
+    NSData* content = [@"hi there" dataUsingEncoding: NSUTF8StringEncoding];
+    NSDictionary* props = @{@"_attachments": @{
+                                    @"foo.txt": @{@"content_type": @"text/plain"},
+                                    @"bar.txt": @{@"content_type": @"text/plain", @"stub": @YES}}
+                            };
+    NSDictionary* attachments = @{@"foo.txt": content,
+                                  @"bar.txt": content};
+
+    NSError* error;
+    Assert(([doc putExistingRevisionWithProperties: props
+                                       attachments: attachments
+                                   revisionHistory: @[@"1-cafebabe"]
+                                           fromURL: nil
+                                             error: &error]));
+
+    CBLRevision* rev = doc.currentRevision;
+    Assert(rev);
+    Assert(!rev.isDeletion);
+    AssertEqual(rev.revisionID, @"1-cafebabe");
+    CBLAttachment* a = [rev attachmentNamed: @"foo.txt"];
+    Assert(a);
+    AssertEqual(a.contentType, @"text/plain");
+    AssertEqual(a.content, content);
+    a = [rev attachmentNamed: @"bar.txt"];
+    Assert(a);
+    AssertEqual(a.contentType, @"text/plain");
+    AssertEqual(a.content, content);
 }
 
 
@@ -422,7 +531,8 @@
     doc = [db createDocument];
     Assert(![doc putProperties: properties error: &error]);
     AssertEq(error.code, 403);
-    //AssertEqual(error.localizedDescription, @"forbidden: uncool"); //TODO: Not hooked up yet
+    AssertEqual(error.localizedDescription, @"uncool");
+    AssertEqual(error.localizedFailureReason, @"uncool");
 }
 
 
@@ -452,6 +562,63 @@
         n++;
     }
     AssertEq(n, kNDocs);
+}
+
+- (void) test12_AllDocumentsPrefixMatchLevel {
+    [self createDocumentWithProperties:@{@"_id": @"three"}];
+    [self createDocumentWithProperties:@{@"_id": @"four"}];
+    [self createDocumentWithProperties:@{@"_id": @"five"}];
+    [self createDocumentWithProperties:@{@"_id": @"eight"}];
+    [self createDocumentWithProperties:@{@"_id": @"fifteen"}];
+
+    // clear the cache so all documents/revisions will be re-fetched:
+    [db _clearDocumentCache];
+
+    CBLQuery* query = [db createAllDocumentsQuery];
+    CBLQueryEnumerator* rows = nil;
+
+    // Set prefixMatchLevel = 1, no startKey, ascending:
+    query.descending = NO;
+    query.endKey = @"f";
+    query.prefixMatchLevel = 1;
+    rows = [query run: NULL];
+    AssertEq(rows.count, 4u);
+    AssertEqual(rows.nextRow.key, @"eight");
+    AssertEqual(rows.nextRow.key, @"fifteen");
+    AssertEqual(rows.nextRow.key, @"five");
+    AssertEqual(rows.nextRow.key, @"four");
+
+    // Set prefixMatchLevel = 1, ascending:
+    query.descending = NO;
+    query.startKey = @"f";
+    query.endKey = @"f";
+    query.prefixMatchLevel = 1;
+    rows = [query run: NULL];
+    AssertEq(rows.count, 3u);
+    AssertEqual(rows.nextRow.key, @"fifteen");
+    AssertEqual(rows.nextRow.key, @"five");
+    AssertEqual(rows.nextRow.key, @"four");
+
+    // Set prefixMatchLevel = 1, descending:
+    query.descending = YES;
+    query.startKey = @"f";
+    query.endKey = @"f";
+    query.prefixMatchLevel = 1;
+    rows = [query run: NULL];
+    AssertEq(rows.count, 3u);
+    AssertEqual(rows.nextRow.key, @"four");
+    AssertEqual(rows.nextRow.key, @"five");
+    AssertEqual(rows.nextRow.key, @"fifteen");
+
+    // Set prefixMatchLevel = 1, ascending, prefix = fi:
+    query.descending = NO;
+    query.startKey = @"fi";
+    query.endKey = @"fi";
+    query.prefixMatchLevel = 1;
+    rows = [query run: NULL];
+    AssertEq(rows.count, 2u);
+    AssertEqual(rows.nextRow.key, @"fifteen");
+    AssertEqual(rows.nextRow.key, @"five");
 }
 
 
@@ -517,6 +684,72 @@
 }
 
 
+- (void) test12_AllDocumentsBySequenceDescending {
+    static const NSUInteger kNDocs = 10;
+    [self createDocuments: kNDocs];
+
+    // clear the cache so all documents/revisions will be re-fetched:
+    [db _clearDocumentCache];
+
+    CBLQuery* query = [db createAllDocumentsQuery];
+    query.descending = YES;
+    query.allDocsMode = kCBLBySequence;
+    CBLQueryEnumerator* rows = [query run: NULL];
+    SequenceNumber n = kNDocs;
+    for (CBLQueryRow* row in rows) {
+        CBLDocument* doc = row.document;
+        Assert(doc, @"Couldn't get doc from query");
+        AssertEq(doc.currentRevision.sequence, n);
+        n--;
+    }
+    AssertEq(n, 0);
+
+    query = [db createAllDocumentsQuery];
+    query.descending = YES;
+    query.allDocsMode = kCBLBySequence;
+    query.startKey = @3;
+    rows = [query run: NULL];
+    n = 3;
+    for (CBLQueryRow* row in rows) {
+        CBLDocument* doc = row.document;
+        Assert(doc, @"Couldn't get doc from query");
+        AssertEq(doc.currentRevision.sequence, n);
+        n--;
+    }
+    AssertEq(n, 0);
+
+    query = [db createAllDocumentsQuery];
+    query.descending = YES;
+    query.allDocsMode = kCBLBySequence;
+    query.endKey = @6;
+    rows = [query run: NULL];
+    n = kNDocs;
+    for (CBLQueryRow* row in rows) {
+        CBLDocument* doc = row.document;
+        Assert(doc, @"Couldn't get doc from query");
+        AssertEq(doc.currentRevision.sequence, n);
+        n--;
+    }
+    AssertEq(n, 5);
+
+    query = [db createAllDocumentsQuery];
+    query.descending = YES;
+    query.allDocsMode = kCBLBySequence;
+    query.startKey = @6;
+    query.endKey = @3;
+    query.inclusiveStart = query.inclusiveEnd = NO;
+    rows = [query run: NULL];
+    n = 5;
+    for (CBLQueryRow* row in rows) {
+        CBLDocument* doc = row.document;
+        Assert(doc, @"Couldn't get doc from query");
+        AssertEq(doc.currentRevision.sequence, n);
+        n--;
+    }
+    AssertEq(n, 3);
+}
+
+
 - (void) test13_LocalDocs {
     NSDictionary* props = [db existingLocalDocumentWithID: @"dock"];
     AssertNil(props);
@@ -525,7 +758,14 @@
             @"Couldn't put new local doc: %@", error);
     props = [db existingLocalDocumentWithID: @"dock"];
     AssertEqual(props[@"foo"], @"bar");
+    Assert([props[@"_rev"] hasPrefix: @"1-"]);
     
+    Assert([db putLocalDocument: @{@"crave": @"mineral"} withID: @"dock" error: &error],
+           @"Couldn't update local doc: %@", error);
+    props = [db existingLocalDocumentWithID: @"dock"];
+    AssertEqual(props[@"crave"], @"mineral");
+    Assert([props[@"_rev"] hasPrefix: @"2-"]);
+
     Assert([db putLocalDocument: @{@"FOOO": @"BARRR"} withID: @"dock" error: &error],
             @"Couldn't update local doc: %@", error);
     props = [db existingLocalDocumentWithID: @"dock"];
@@ -783,6 +1023,24 @@
     Assert(!error);
     Assert(rev4);
     AssertEq([rev4.attachmentNames count], (NSUInteger)0);
+
+    // Add an attachment with revpos=0 (see #1200)
+    NSMutableDictionary* props = [rev3.properties mutableCopy];
+    NSMutableDictionary* atts = [props.cbl_attachments mutableCopy];
+    props[@"_attachments"] = atts;
+    atts[@"zero.txt"] = @{@"content_type": @"text/plain",
+                          @"revpos": @0,
+                          @"following": @YES};
+    BOOL ok = [doc putExistingRevisionWithProperties: props
+                                         attachments: @{@"zero.txt": [@"zero" dataUsingEncoding: NSUTF8StringEncoding]}
+                                     revisionHistory: @[@"3-0000", rev3.revisionID, rev.revisionID]
+                                             fromURL: nil
+                                               error: &error];
+    Assert(ok, @"Adding attachment with revpos=0 failed: %@", error);
+
+    CBLRevision* rev5 = [doc revisionWithID: @"3-0000"];
+    CBLAttachment* att = [rev5 attachmentNamed: @"zero.txt"];
+    Assert(att);
 }
 
 
@@ -955,7 +1213,7 @@
 - (void) testReplaceDatabaseNamed: (NSString*)name
                  withDatabaseFile: (NSString*)databaseFile
                    attachmentsDir: (NSString*)attachmentsDir
-                       onComplete: (void (^)(CBLQueryEnumerator*))onComplete {
+                       onComplete: (void (^)(CBLDatabase*, CBLQueryEnumerator*))onComplete {
     NSError* error;
     BOOL success = [dbmgr replaceDatabaseNamed: name withDatabaseFile: databaseFile
                                withAttachments: attachmentsDir error: &error];
@@ -970,7 +1228,7 @@
 
 - (void) testReplaceDatabaseNamed: (NSString*)name
                   withDatabaseDir: (NSString*)databaseDir
-                       onComplete: (void (^)(CBLQueryEnumerator*))onComplete {
+                       onComplete: (void (^)(CBLDatabase*, CBLQueryEnumerator*))onComplete {
     NSError* error;
     BOOL success = [dbmgr replaceDatabaseNamed: name withDatabaseDir: databaseDir error: &error];
     Assert(success, @"Couldn't replace database named %@ with the database at %@ : %@",
@@ -984,10 +1242,11 @@
 
 
 - (void) checkReplacedDatabaseNamed: (NSString*)name
-                         onComplete: (void (^)(CBLQueryEnumerator*))onComplete {
+                         onComplete: (void (^)(CBLDatabase*, CBLQueryEnumerator*))onComplete {
     NSError* error;
     CBLDatabase* replaceDb = [dbmgr existingDatabaseNamed: name error: &error];
     Assert(replaceDb, @"Couldn't find the replaced database named %@ : %@", name, error);
+
     CBLView* view = [replaceDb viewNamed: @"myview"];
     Assert(view);
     [view setMapBlock: MAPBLOCK({
@@ -998,9 +1257,9 @@
     query.prefetch = YES;
     Assert(query);
     CBLQueryEnumerator* rows = [query run: &error];
-    Assert(rows, @"Could query the replaced database named %@ : %@", name, error);
+    Assert(rows, @"Couldn't query the replaced database named %@ : %@", name, error);
 
-    onComplete(rows);
+    onComplete(replaceDb, rows);
 }
 
 
@@ -1009,11 +1268,14 @@
     if (dir)
         subDir = [subDir stringByAppendingPathComponent:dir];
 
-    return [[NSBundle bundleForClass: [self class]] pathForResource: fileName ofType: nil
-                                                        inDirectory: subDir];
+    NSString* path = [[NSBundle bundleForClass: [self class]] pathForResource: fileName ofType: nil
+                                                                  inDirectory: subDir];
+    Assert(path, @"FATAL: Missing file '%@' in bundle directory '%@'", fileName, subDir);
+    return path;
 }
 
-- (void) test23_ReplaceOldVersionDatabase {
+
+- (void) test23_ReplaceDatabaseSQLite {
     // Test only SQLite:
     if (!self.isSQLiteDB)
         return;
@@ -1022,7 +1284,7 @@
     NSString* dbFile = [self pathToReplaceDbFile: @"iosdb.cblite" inDirectory: @"ios104"];
     NSString* attsFile = [self pathToReplaceDbFile: @"iosdb attachments" inDirectory: @"ios104"];
     [self testReplaceDatabaseNamed: @"replacedb" withDatabaseFile: dbFile attachmentsDir: attsFile
-                        onComplete: ^(CBLQueryEnumerator *rows) {
+                        onComplete: ^(CBLDatabase* replaceDb, CBLQueryEnumerator* rows) {
                             AssertEq(rows.count, 1u);
                             CBLDocument* doc = [rows rowAtIndex: 0].document;
                             AssertEqual(doc.documentID, @"doc1");
@@ -1039,7 +1301,7 @@
     dbFile = [self pathToReplaceDbFile: @"iosdb.cblite" inDirectory: @"ios110"];
     attsFile = [self pathToReplaceDbFile: @"iosdb attachments" inDirectory: @"ios110"];
     [self testReplaceDatabaseNamed: @"replacedb" withDatabaseFile: dbFile attachmentsDir: attsFile
-                        onComplete: ^(CBLQueryEnumerator *rows) {
+                        onComplete: ^(CBLDatabase* replaceDb, CBLQueryEnumerator* rows) {
                             AssertEq(rows.count, 1u);
                             CBLDocument* doc = [rows rowAtIndex:0].document;
                             AssertEqual(doc.documentID, @"doc1");
@@ -1055,24 +1317,23 @@
     // iOS 1.2.0
     dbFile = [self pathToReplaceDbFile: @"iosdb.cblite2" inDirectory: @"ios120"];
     [self testReplaceDatabaseNamed: @"replacedb" withDatabaseDir: dbFile
-                        onComplete: ^(CBLQueryEnumerator *rows) {
-                            AssertEq(rows.count, 1u);
+                        onComplete: ^(CBLDatabase* replaceDb, CBLQueryEnumerator* rows) {
+                            AssertEq(rows.count, 2u);
                             CBLDocument* doc = [rows rowAtIndex:0].document;
                             AssertEqual(doc.documentID, @"doc1");
-                            AssertEq(doc.currentRevision.attachments.count, 2u);
-                            CBLAttachment* att1 = [doc.currentRevision attachmentNamed: @"attach1"];
-                            Assert(att1);
-                            AssertEq(att1.length, att1.content.length);
-                            CBLAttachment* att2 = [doc.currentRevision attachmentNamed: @"attach2"];
-                            Assert(att2);
-                            AssertEq(att2.length, att2.content.length);
+                            AssertEq(doc.currentRevision.attachments.count, 1u);
+                            CBLAttachment* att= [doc.currentRevision attachmentNamed: @"attach1"];
+                            Assert(att);
+                            AssertEq(att.length, att.content.length);
+                            NSDictionary* localDoc = [replaceDb existingLocalDocumentWithID: @"local1"];
+                            Assert(localDoc);
                         }];
 
     // Android 1.0.4
     dbFile = [self pathToReplaceDbFile: @"androiddb.cblite" inDirectory: @"android104"];
     attsFile = [self pathToReplaceDbFile: @"androiddb/attachments" inDirectory: @"android104"];
     [self testReplaceDatabaseNamed: @"replacedb" withDatabaseFile: dbFile attachmentsDir: attsFile
-                        onComplete: ^(CBLQueryEnumerator *rows) {
+                        onComplete: ^(CBLDatabase* replaceDb, CBLQueryEnumerator* rows) {
                             AssertEq(rows.count, 2u);
                             CBLDocument* doc = [rows rowAtIndex:0].document;
                             AssertEqual(doc.documentID, @"doc0");
@@ -1086,7 +1347,7 @@
     dbFile = [self pathToReplaceDbFile: @"androiddb.cblite" inDirectory: @"android110"];
     attsFile = [self pathToReplaceDbFile: @"androiddb attachments" inDirectory: @"android110"];
     [self testReplaceDatabaseNamed: @"replacedb" withDatabaseFile: dbFile attachmentsDir: attsFile
-                        onComplete: ^(CBLQueryEnumerator *rows) {
+                        onComplete: ^(CBLDatabase* replaceDb, CBLQueryEnumerator* rows) {
                             AssertEq(rows.count, 2u);
                             CBLDocument* doc = [rows rowAtIndex:0].document;
                             AssertEqual(doc.documentID, @"doc0");
@@ -1096,11 +1357,26 @@
                             AssertEq(att1.length, att1.content.length);
                         }];
 
+    // Android 1.2.0
+    dbFile = [self pathToReplaceDbFile: @"androiddb.cblite2" inDirectory: @"android120"];
+    [self testReplaceDatabaseNamed: @"replacedb" withDatabaseDir: dbFile
+                        onComplete: ^(CBLDatabase* replaceDb, CBLQueryEnumerator* rows) {
+                            AssertEq(rows.count, 2u);
+                            CBLDocument* doc = [rows rowAtIndex:0].document;
+                            AssertEqual(doc.documentID, @"doc1");
+                            AssertEq(doc.currentRevision.attachments.count, 1u);
+                            CBLAttachment* att= [doc.currentRevision attachmentNamed: @"attach1"];
+                            Assert(att);
+                            AssertEq(att.length, att.content.length);
+                            NSDictionary* localDoc = [replaceDb existingLocalDocumentWithID: @"local1"];
+                            Assert(localDoc);
+                        }];
+
     // .NET 1.0.4
     dbFile = [self pathToReplaceDbFile: @"netdb.cblite" inDirectory: @"net104"];
     attsFile = [self pathToReplaceDbFile: @"netdb/attachments" inDirectory: @"net104"];
     [self testReplaceDatabaseNamed: @"replacedb" withDatabaseFile: dbFile attachmentsDir: attsFile
-                        onComplete: ^(CBLQueryEnumerator *rows) {
+                        onComplete: ^(CBLDatabase* replaceDb, CBLQueryEnumerator* rows) {
                             AssertEq(rows.count, 2u);
                             CBLDocument* doc = [rows rowAtIndex:1].document;
                             AssertEqual(doc.documentID, @"doc2");
@@ -1114,7 +1390,7 @@
     dbFile = [self pathToReplaceDbFile: @"netdb.cblite" inDirectory: @"net110"];
     attsFile = [self pathToReplaceDbFile: @"netdb attachments" inDirectory: @"net110"];
     [self testReplaceDatabaseNamed: @"replacedb" withDatabaseFile: dbFile attachmentsDir: attsFile
-                        onComplete: ^(CBLQueryEnumerator *rows) {
+                        onComplete: ^(CBLDatabase* replaceDb, CBLQueryEnumerator* rows) {
                             AssertEq(rows.count, 1u);
                             CBLDocument* doc = [rows rowAtIndex:0].document;
                             AssertEqual(doc.documentID, @"doc1");
@@ -1123,7 +1399,261 @@
                             Assert(att1);
                             AssertEq(att1.length, att1.content.length);
                         }];
+
+    // .NET 1.2.0
+    dbFile = [self pathToReplaceDbFile: @"netdb.cblite2" inDirectory: @"net120"];
+    [self testReplaceDatabaseNamed: @"replacedb" withDatabaseDir: dbFile
+                        onComplete: ^(CBLDatabase* replaceDb, CBLQueryEnumerator* rows) {
+                            AssertEq(rows.count, 2u);
+                            CBLDocument* doc = [rows rowAtIndex:0].document;
+                            AssertEqual(doc.documentID, @"doc1");
+                            AssertEq(doc.currentRevision.attachments.count, 1u);
+                            CBLAttachment* att= [doc.currentRevision attachmentNamed: @"attach1"];
+                            Assert(att);
+                            AssertEq(att.length, att.content.length);
+                            NSDictionary* localDoc = [replaceDb existingLocalDocumentWithID: @"local1"];
+                            Assert(localDoc);
+                        }];
 }
 
+
+- (void) test23b_ReplaceDatabaseForestDB {
+    // Test only ForestDB:
+    if (self.isSQLiteDB)
+        return;
+
+    // iOS 1.2.0
+    NSString* dbFile = [self pathToReplaceDbFile: @"iosdb.cblite2" inDirectory: @"ios120-forestdb"];
+    [self testReplaceDatabaseNamed: @"replacedb" withDatabaseDir: dbFile
+                        onComplete: ^(CBLDatabase* replaceDb, CBLQueryEnumerator* rows) {
+                            AssertEq(rows.count, 2u);
+                            CBLDocument* doc = [rows rowAtIndex:0].document;
+                            AssertEqual(doc.documentID, @"doc1");
+                            AssertEq(doc.currentRevision.attachments.count, 1u);
+                            CBLAttachment* att= [doc.currentRevision attachmentNamed: @"attach1"];
+                            Assert(att);
+                            AssertEq(att.length, att.content.length);
+                            NSDictionary* localDoc = [replaceDb existingLocalDocumentWithID: @"local1"];
+                            Assert(localDoc);
+                        }];
+
+
+    // Android 1.2.0
+    dbFile = [self pathToReplaceDbFile: @"androiddb.cblite2" inDirectory: @"android120-forestdb"];
+    [self testReplaceDatabaseNamed: @"replacedb" withDatabaseDir: dbFile
+                        onComplete: ^(CBLDatabase* replaceDb, CBLQueryEnumerator* rows) {
+                            AssertEq(rows.count, 2u);
+                            CBLDocument* doc = [rows rowAtIndex:0].document;
+                            AssertEqual(doc.documentID, @"doc1");
+                            AssertEq(doc.currentRevision.attachments.count, 1u);
+                            CBLAttachment* att= [doc.currentRevision attachmentNamed: @"attach1"];
+                            Assert(att);
+                            AssertEq(att.length, att.content.length);
+                            NSDictionary* localDoc = [replaceDb existingLocalDocumentWithID: @"local1"];
+                            Assert(localDoc);
+                        }];
+
+    // .NET 1.2.0
+    dbFile = [self pathToReplaceDbFile: @"netdb.cblite2" inDirectory: @"net120-forestdb"];
+    [self testReplaceDatabaseNamed: @"replacedb" withDatabaseDir: dbFile
+                        onComplete: ^(CBLDatabase* replaceDb, CBLQueryEnumerator* rows) {
+                            AssertEq(rows.count, 2u);
+                            CBLDocument* doc = [rows rowAtIndex:0].document;
+                            AssertEqual(doc.documentID, @"doc1");
+                            AssertEq(doc.currentRevision.attachments.count, 1u);
+                            CBLAttachment* att= [doc.currentRevision attachmentNamed: @"attach1"];
+                            Assert(att);
+                            AssertEq(att.length, att.content.length);
+                            NSDictionary* localDoc = [replaceDb existingLocalDocumentWithID: @"local1"];
+                            Assert(localDoc);
+                        }];
+}
+
+
+- (void) test24_upgradeDatabase {
+    // Install a canned database:
+    NSString* dbDir = [self pathToReplaceDbFile: @"iosdb.cblite2" inDirectory: @"ios120"];
+    NSError* error;
+    Assert([dbmgr replaceDatabaseNamed: @"replacedb" withDatabaseDir: dbDir error: &error]);
+
+    // Open installed db with storageType set to this test's storage type:
+    CBLDatabaseOptions* options = [CBLDatabaseOptions new];
+    options.storageType = self.isSQLiteDB ? kCBLSQLiteStorage : kCBLForestDBStorage;
+    CBLDatabase* replacedb = [dbmgr openDatabaseNamed: @"replacedb" withOptions: options error: &error];
+    Assert(replacedb, @"Opening db failed: %@", error);
+
+    // Verify storage type matches what we requested:
+    AssertEqual(replacedb.storage.class.description, self.isSQLiteDB ? @"CBL_SQLiteStorage" : @"CBL_ForestDBStorage");
+
+    // Test db contents:
+    [self checkReplacedDatabaseNamed: @"replacedb"
+                         onComplete: ^(CBLDatabase* targetDb, CBLQueryEnumerator* rows) {
+                             AssertEq(rows.count, 2u);
+                             CBLDocument* doc = [rows rowAtIndex:0].document;
+                             AssertEqual(doc.documentID, @"doc1");
+                             AssertEq(doc.currentRevision.attachments.count, 1u);
+                             CBLAttachment* att= [doc.currentRevision attachmentNamed: @"attach1"];
+                             Assert(att);
+                             AssertEq(att.length, att.content.length);
+                             
+                             // https://github.com/couchbase/couchbase-lite-ios/issues/1041:
+                             NSDictionary* localDoc = [targetDb existingLocalDocumentWithID: @"local1"];
+                             Assert(localDoc);
+                          }];
+
+    // Close and re-open the db using SQLite storage type. Should fail if it used to be ForestDB:
+    Assert([replacedb close: &error]);
+    options.storageType = kCBLSQLiteStorage;
+    replacedb = [dbmgr openDatabaseNamed: @"replacedb" withOptions: options error: &error];
+    if (self.isSQLiteDB) {
+        Assert(replacedb, @"Couldn't re-open SQLite db");
+    } else {
+        Assert(!replacedb, @"Incorrectly re-opened ForestDB db as SQLite");
+        AssertEq(error.code, 406);
+    }
+}
+
+
+#pragma mark - ETC.
+
+
+- (void) test25_CloseDatabase {
+    // Add some documents:
+    for (NSUInteger i = 0; i < 10; i++) {
+        CBLDocument* doc = [db createDocument];
+        CBLSavedRevision* rev = [doc putProperties: @{@"foo": @"bar"} error: nil];
+        Assert(rev);
+    }
+    
+    // Use the background database:
+    __block CBLDatabase* bgdb;
+    XCTestExpectation* expectation =
+        [self expectationWithDescription: @"Adding a document in background"];
+    [dbmgr backgroundTellDatabaseNamed: db.name to: ^(CBLDatabase *_bgdb) {
+        bgdb = _bgdb;
+        CBLDocument* doc = [_bgdb createDocument];
+        CBLSavedRevision* rev = [doc putProperties: @{@"foo": @"bar"} error: nil];
+        [expectation fulfill];
+        Assert(rev);
+    }];
+    [self waitForExpectationsWithTimeout: 1.0 handler: nil];
+    
+    // Close database:
+    NSError* error;
+    [self keyValueObservingExpectationForObject: bgdb keyPath: @"isOpen" expectedValue: @(NO)];
+    Assert([db close: &error], @"Cannot close the database: %@", error);
+    [self waitForExpectationsWithTimeout: 1.0 handler: nil];
+}
+
+
+- (void) test26_DocumentExpiry {
+    NSDate* future = [NSDate dateWithTimeIntervalSinceNow: 12345];
+    Log(@"Now is %@", [NSDate date]);
+    CBLDocument* doc = [self createDocumentWithProperties: @{@"foo": @17}];
+    AssertNil(doc.expirationDate);
+    doc.expirationDate = future;
+    NSDate* exp = doc.expirationDate;
+    Log(@"Doc expiration is %@", exp);
+    Assert(exp != nil);
+    Assert(fabs([exp timeIntervalSinceDate: future]) < 1.0);
+
+    NSDate* next = [NSDate dateWithTimeIntervalSince1970: db.storage.nextDocumentExpiry];
+    Log(@"Next expiration at %@", next);
+
+    doc.expirationDate = nil;
+    AssertNil(doc.expirationDate);
+
+    AssertEq(db.storage.nextDocumentExpiry, 0ull);
+
+    // Can a nonexistent document have an expiration date?
+    doc = db[@"foo"];
+    AssertNil(doc.expirationDate);
+    doc.expirationDate = future;
+    exp = doc.expirationDate;
+    Log(@"Nonexistent doc expiration is %@", exp);
+//    Assert(exp != nil);
+//    Assert(fabs(exp.timeIntervalSince1970 - now.timeIntervalSince1970) < 1.0);
+//    AssertEq(db.storage.nextDocumentExpiry, (UInt64)exp.timeIntervalSince1970);
+
+    Log(@"Creating documents");
+    [self createDocuments: 10000];
+
+    Log(@"Marking docs for expiration");
+    __block int total = 0, marked = 0;
+    __block CBLDocument* someDoc = nil;
+    [db inTransaction:^BOOL{
+        for (CBLQueryRow* row in [[db createAllDocumentsQuery] run: NULL]) {
+            CBLDocument* doc = row.document;
+            int sequence = [doc[@"sequence"] intValue];
+            if (sequence % 10 == 6) {
+                doc.expirationDate = [NSDate dateWithTimeIntervalSinceNow: 2];
+                someDoc = doc;
+                ++marked;
+            } else if (sequence % 10 == 3) {
+                doc.expirationDate = future;
+            }
+            ++total;
+        }
+        return YES;
+    }];
+    AssertEq(total, 10001);
+    AssertEq(marked, 1000);
+
+    next = [NSDate dateWithTimeIntervalSince1970: db.storage.nextDocumentExpiry];
+    Log(@"Next expiration at %@ (in %.3f sec)", next, next.timeIntervalSinceNow);
+    Assert(next.timeIntervalSinceNow <= 2);
+    Assert(next.timeIntervalSinceNow >= -20);
+
+    __block unsigned dbChangesReceived = 0;
+    [self expectationForNotification: kCBLDatabaseChangeNotification
+                              object: db
+                             handler: ^BOOL(NSNotification* notification) {
+                                 NSArray* changes = notification.userInfo[@"changes"];
+                                 NSUInteger purges = 0;
+                                 for (CBLDatabaseChange* change in changes) {
+                                     Assert(change.documentID);
+                                     if (!change.revisionID)
+                                         ++purges;
+                                 }
+                                 Log(@"Received %@ with %lu changes, %lu purges",
+                                     notification.name, (unsigned long)changes.count, (unsigned long)purges);
+                                 dbChangesReceived += purges;
+                                 Assert(dbChangesReceived <= 1000);
+                                 return (dbChangesReceived >= 1000);
+                             }];
+
+    Assert(someDoc.currentRevision != nil);
+    [self expectationForNotification: kCBLDocumentChangeNotification
+                              object: someDoc
+                             handler: ^BOOL(NSNotification* notification) {
+                                 Log(@"Received %@", notification);
+                                 CBLDatabaseChange* change = notification.userInfo[@"change"];
+                                 Assert(change);
+                                 AssertEqual(change.documentID, someDoc.documentID);
+                                 AssertNil(change.revisionID);
+                                 AssertNil(someDoc.currentRevision);
+                                 return YES;
+                             }];
+
+    Log(@"Waiting for auto-expiration...");
+    NSPredicate* expiredPred = [NSPredicate predicateWithFormat: @"documentCount <= 9001"];
+    (void)[self expectationForPredicate: expiredPred evaluatedWithObject: db handler: nil];
+
+    [self waitForExpectationsWithTimeout: 5.0 handler: nil];
+    AssertEq(db.documentCount, 9001u);
+
+    total = 0;
+    for (CBLQueryRow* row in [[db createAllDocumentsQuery] run: NULL]) {
+        CBLDocument* doc = row.document;
+        int sequence = [doc[@"sequence"] intValue];
+        Assert(sequence % 10 != 6);
+        ++total;
+    }
+    AssertEq(total, 9001);
+
+    next = [NSDate dateWithTimeIntervalSince1970: db.storage.nextDocumentExpiry];
+    Log(@"Now next expiration is %@", next);
+    Assert(fabs([next timeIntervalSinceDate: future]) < 1.0);
+}
 
 @end

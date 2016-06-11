@@ -25,6 +25,8 @@
 #import "CBLCache.h"
 #import "CBLManager+Internal.h"
 #import "CBLMisc.h"
+#import "CBLSymmetricKey.h"
+#import "MYAction.h"
 #import "MYBlockUtils.h"
 #import "ExceptionUtils.h"
 
@@ -192,11 +194,6 @@ static void catchInBlock(void (^block)()) {
 }
 
 
-- (BOOL) create: (NSError**)outError {
-    return [self open: outError];
-}
-
-
 - (BOOL) close: (NSError**)outError {
     if (![self saveAllModels: outError])
         return NO;
@@ -208,7 +205,9 @@ static void catchInBlock(void (^block)()) {
 
 
 - (BOOL) deleteDatabase: (NSError**)outError {
-    LogTo(CBLDatabase, @"Deleting %@", _dir);
+    if (_readOnly)
+        return CBLStatusToOutNSError(kCBLStatusForbidden, outError);
+    LogTo(Database, @"Deleting %@", _dir);
     [[NSNotificationCenter defaultCenter] postNotificationName: CBL_DatabaseWillBeDeletedNotification
                                                         object: self];
     [self _close];
@@ -224,6 +223,8 @@ static void catchInBlock(void (^block)()) {
 
 
 - (BOOL) compact: (NSError**)outError {
+    if (_readOnly)
+        return CBLStatusToOutNSError(kCBLStatusForbidden, outError);
     //FIX:
 //    CBLStatus status = [_storage inTransaction: ^CBLStatus {
         // Do this in a transaction because garbageCollectAttachments expects the database to be
@@ -255,9 +256,33 @@ static void catchInBlock(void (^block)()) {
     if (status == kCBLStatusOK)
         return YES;
 
-    if (outError)
-        *outError = CBLStatusToNSError(status, nil);
+    CBLStatusToOutNSError(status, outError);
     return NO;
+}
+
+
+- (BOOL) changeEncryptionKey: (id)newKeyOrPassword error: (NSError**)outError {
+    if (_readOnly)
+        return CBLStatusToOutNSError(kCBLStatusForbidden, outError);
+    if (![_storage respondsToSelector: @selector(actionToChangeEncryptionKey:)])
+        return CBLStatusToOutNSError(kCBLStatusNotImplemented, outError);
+
+    CBLSymmetricKey* newKey = nil;
+    if (newKeyOrPassword) {
+        newKey = [[CBLSymmetricKey alloc] initWithKeyOrPassword: newKeyOrPassword];
+        if (!newKey)
+            return CBLStatusToOutNSError(kCBLStatusBadRequest, outError);
+    }
+
+    MYAction* action = [_storage actionToChangeEncryptionKey: newKey];
+    if (!action)
+        return CBLStatusToOutNSError(kCBLStatusNotImplemented, outError);
+    [action addAction: [_attachments actionToChangeEncryptionKey: newKey]];
+    [action addPerform:^BOOL(NSError** error) {
+        [_manager registerEncryptionKey: newKeyOrPassword forDatabaseNamed: _name];
+        return YES;
+    } backOut: nil cleanUp: nil];
+    return [action run: outError];
 }
 
 
@@ -312,6 +337,10 @@ static void catchInBlock(void (^block)()) {
     [_docCache forgetAllResources];
 }
 
+- (void) _pruneDocumentCache {
+    [_docCache unretainResources];
+}
+
 - (void) removeDocumentFromCache: (CBLDocument*)document {
     [_docCache forgetResource: document];
 }
@@ -347,8 +376,8 @@ static NSString* makeLocalDocID(NSString* docID) {
                           prevRevisionID: nil
                                 obeyMVCC: NO
                                   status: &status] != nil;
-    if (!ok && outError)
-        *outError = CBLStatusToNSError(status, nil);
+    if (!ok)
+        CBLStatusToOutNSError(status, outError);
     return ok;
 }
 

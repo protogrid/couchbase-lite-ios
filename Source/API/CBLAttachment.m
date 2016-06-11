@@ -18,7 +18,7 @@
 
 #import "CBLDatabase+Attachments.h"
 #import "CBL_Attachment.h"
-#import "CBL_BlobStore.h"
+#import "CBL_BlobStoreWriter.h"
 #import "CBLInternal.h"
 
 
@@ -59,10 +59,16 @@
     self = [super init];
     if (self) {
         NSNumber* lengthObj = nil;
-        if ([body isKindOfClass: [NSData class]])
+        if ([body isKindOfClass: [NSData class]]) {
+            body = [body copy];
             lengthObj = @([body length]);
-        else
-            [(NSURL*)body getResourceValue: &lengthObj forKey: NSURLFileSizeKey error: NULL];
+        } else {
+            NSURL* bodyURL = $castIf(NSURL, body);
+            if (!bodyURL.isFileURL)
+                return nil;
+            if (![bodyURL getResourceValue: &lengthObj forKey: NSURLFileSizeKey error: NULL])
+                return nil;
+        }
         _metadata = $dict({@"content_type", contentType},
                           {@"length", lengthObj},
                           {@"follows", $true});
@@ -98,6 +104,12 @@
 }
 
 
+- (UInt64) encodedLength {
+    NSNumber* lengthObj = $castIf(NSNumber, _metadata[@"encoded_length"] ?: _metadata[@"length"]);
+    return lengthObj ? [lengthObj longLongValue] : 0;
+}
+
+
 #pragma mark - BODY
 
 
@@ -109,6 +121,16 @@
 
 - (NSData*) bodyIfNew {
     return _body ? self.content : nil;
+}
+
+
+- (BOOL) contentAvailable {
+    if (_body) {
+        return ([_body isKindOfClass: [NSData class]] ||
+                ([_body isKindOfClass: [NSURL class]] && [_body isFileURL]));
+    } else {
+        return self._internalAttachment.hasContent;
+    }
 }
 
 
@@ -147,18 +169,18 @@
         else if ([_body isKindOfClass: [NSURL class]] && [_body isFileURL])
             stream = [NSInputStream inputStreamWithURL: _body];
     } else {
-        stream = self._internalAttachment.contentStream;
+        stream = [self._internalAttachment getContentStreamDecoded: YES andLength: NULL];
     }
     [stream open];
     return stream;
 }
 
 
-static CBL_BlobStoreWriter* blobStoreWriterForBody(CBLDatabase* tddb, NSData* body) {
-    CBL_BlobStoreWriter* writer = tddb.attachmentWriter;
-    [writer appendData: body];
-    [writer finish];
-    return writer;
+- (BOOL) purge {
+    CBLBlobKey key;
+    return !_body
+        && [CBL_Attachment digest: _metadata[@"digest"] toBlobKey: &key]
+        && [_rev.database.attachmentStore deleteBlobForKey: key];
 }
 
 
@@ -168,7 +190,6 @@ static CBL_BlobStoreWriter* blobStoreWriterForBody(CBLDatabase* tddb, NSData* bo
 + (NSDictionary*) installAttachmentBodies: (NSDictionary*)attachments
                              intoDatabase: (CBLDatabase*)database
 {
-    CBLDatabase* tddb = database;
     return [attachments my_dictionaryByUpdatingValues: ^id(NSString* name, id value) {
         CBLAttachment* attachment = $castIf(CBLAttachment, value);
         if (attachment) {
@@ -179,11 +200,15 @@ static CBL_BlobStoreWriter* blobStoreWriterForBody(CBLDatabase* tddb, NSData* bo
             if (body) {
                 // Copy attachment body into the database's blob store:
                 // OPT: If _body is an NSURL, could just copy the file without reading into RAM
-                CBL_BlobStoreWriter* writer = blobStoreWriterForBody(tddb, body);
+                CBL_BlobStoreWriter* writer = [database attachmentWriter];
+                [writer appendData: body];
+                [writer finish];
+                [database rememberAttachmentWriter: writer];
                 metadata[@"length"] = @(body.length);
                 metadata[@"digest"] = writer.MD5DigestString;
                 metadata[@"follows"] = $true;
-                [tddb rememberAttachmentWriter: writer];
+                LogTo(Database, @"%@: Stored new CBLAttachment '%@' %@",
+                      database.name, name, metadata.my_compactDescription);
             }
         }
         return value;

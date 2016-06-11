@@ -20,6 +20,12 @@ static const NSUInteger kDefaultRetainLimit = 50;
 
 
 @implementation CBLCache
+{
+    @private
+    NSMapTable* _map;           // Weak mapping, docID-->Document
+    NSMutableArray* _recents;   // Retains recently-used documents (least recently used first)
+    NSUInteger _retainLimit;    // Max number of docs to retain
+}
 
 
 - (instancetype) init {
@@ -30,55 +36,44 @@ static const NSUInteger kDefaultRetainLimit = 50;
 - (instancetype) initWithRetainLimit: (NSUInteger)retainLimit {
     self = [super init];
     if (self) {
-#if CBLCACHE_IS_SMART
         // Construct an NSMapTable with weak references to values, which automatically removes
         // key/value pairs when a value is dealloced.
         _map = [[NSMapTable alloc] initWithKeyOptions: NSMapTableStrongMemory
                                          valueOptions: NSMapTableWeakMemory
                                              capacity: 100];
-#else
-        // Construct a CFDictionary that doesn't retain its values. It does _not_ automatically
-        // remove dealloced values, so we'll have to do it manually in -resourceBeingDeallocated.
-        CFDictionaryValueCallBacks valueCB = kCFTypeDictionaryValueCallBacks;
-        valueCB.retain = NULL;
-        valueCB.release = NULL;
-        _map = (NSMutableDictionary*)CFBridgingRelease(CFDictionaryCreateMutable(
-                       NULL, 100, &kCFCopyStringDictionaryKeyCallBacks, &valueCB));
-#endif
         if (retainLimit > 0) {
-            _cache = [[NSCache alloc] init];
-            _cache.countLimit = retainLimit;
+            _retainLimit = retainLimit;
+            _recents = [[NSMutableArray alloc] initWithCapacity: retainLimit];
         }
     }
     return self;
 }
 
 
-#if ! CBLCACHE_IS_SMART
-- (void)dealloc {
-    for (id<CBLCacheable> doc in _map.objectEnumerator)
-        doc.owningCache = nil;
-}
-#endif
-
-
 - (void) addResource: (id<CBLCacheable>)resource {
-#if ! CBLCACHE_IS_SMART
-    resource.owningCache = self;
-#endif
     NSString* key = resource.cacheKey;
     NSAssert(![_map objectForKey: key], @"Caching duplicate items for '%@': %p, now %p",
              key, [_map objectForKey: key], resource);
     [_map setObject: resource forKey: key];
-    if (_cache)
-        [_cache setObject: resource forKey: key];
+    if (_recents) {
+        if (_recents.count == _retainLimit)
+            [_recents removeObjectAtIndex: 0];    // remove least recently used
+        [_recents addObject: resource];
+    }
 }
 
 
 - (id<CBLCacheable>) resourceWithCacheKey: (NSString*)docID {
     id<CBLCacheable> doc = [_map objectForKey: docID];
-    if (doc && _cache && ![_cache objectForKey:docID])
-        [_cache setObject: doc forKey: docID];  // re-add doc to NSCache since it's recently used
+    if (doc && _recents.count > 1) {
+        // Move doc to the front of the list since it's been accessed:
+        // (Yes, this is O(n), but it's very fast: just a scan for pointer equality).
+        NSUInteger index = [_recents indexOfObjectIdenticalTo: doc];
+        if (index != NSNotFound && index != _recents.count - 1) {
+            [_recents removeObjectAtIndex: index];
+            [_recents addObject: doc];
+        }
+    }
     return doc;
 }
 
@@ -88,34 +83,18 @@ static const NSUInteger kDefaultRetainLimit = 50;
 
 
 - (void) forgetResource: (id<CBLCacheable>)resource {
-#if ! CBLCACHE_IS_SMART
-    CBLCache* cache = resource.owningCache;
-    if (cache) {
-        NSAssert(cache == self, @"Removing object from the wrong cache");
-        resource.owningCache = nil;
-        [_map removeObjectForKey: resource.cacheKey];
-    }
-#else
-    [_map removeObjectForKey: resource.cacheKey];
-#endif
-}
-
-
-#if ! CBLCACHE_IS_SMART
-- (void) resourceBeingDealloced:(id<CBLCacheable>)resource {
     [_map removeObjectForKey: resource.cacheKey];
 }
-#endif
 
 
 - (void) unretainResources {
-    [_cache removeAllObjects];
+    [_recents removeAllObjects];
 }
 
 
 - (void) forgetAllResources {
     [_map removeAllObjects];
-    [_cache removeAllObjects];
+    [_recents removeAllObjects];
 }
 
 

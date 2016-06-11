@@ -30,7 +30,7 @@ NS_ASSUME_NONNULL_BEGIN
     (In other words, does it have a "_deleted_ or "_removed" property?) */
 @property (readonly) BOOL isGone;
 
-/** The ID of this revision. Will be nil if this is an unsaved CBLNewRevision. */
+/** The ID of this revision. Will be nil if this is a CBLUnsavedRevision. */
 @property (readonly, nullable) NSString* revisionID;
 
 /** The revision this one is a child of. */
@@ -41,7 +41,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 /** Returns the ancestry of this revision as an array of CBLRevisions, in chronological order.
     Older revisions are NOT guaranteed to have their properties available. */
-- (CBLArrayOf(CBLRevision*)*) getRevisionHistory: (NSError**)outError;
+- (nullable CBLArrayOf(CBLRevision*)*) getRevisionHistory: (NSError**)outError;
 
 /** The revision's contents as parsed from JSON.
     Keys beginning with "_" are defined and reserved by CouchbaseLite; others are app-specific.

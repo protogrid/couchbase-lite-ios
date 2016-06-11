@@ -14,7 +14,7 @@
 //  and limitations under the License.
 
 #import "CBLQuery+Geo.h"
-#import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 
 
 @implementation CBLQuery (Geo)
@@ -47,14 +47,12 @@
                    geoJSONData: (NSData*)geoJSONData
                          value: (NSData*)valueData
                    docRevision: (CBL_Revision*)docRevision
-                       storage: (id<CBL_QueryRowStorage>)storage
 {
     self = [super initWithDocID: docID
                        sequence: sequence
                             key: nil
                           value: valueData
-                    docRevision: docRevision
-                        storage: storage];
+                    docRevision: docRevision];
     if (self) {
         _boundingBox = bbox;
         _geoJSONData = geoJSONData;
@@ -92,19 +90,6 @@
         return @"Rectangle";        // this is nonstandard...
     else
         return (self.geometry)[@"type"];
-}
-
-
-// Override to return same format as GeoCouch <https://github.com/couchbase/geocouch/>
-- (NSDictionary*) asJSONDictionary {
-    NSMutableDictionary* dict = [[super asJSONDictionary] mutableCopy];
-    if (!dict[@"error"]) {
-        [dict removeObjectForKey: @"key"];
-        dict[@"geometry"] = self.geometry;
-        dict[@"bbox"] = @[@(_boundingBox.min.x), @(_boundingBox.min.y),
-                          @(_boundingBox.max.x), @(_boundingBox.max.y)];
-    }
-    return dict;
 }
 
 

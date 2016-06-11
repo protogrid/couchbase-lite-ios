@@ -12,13 +12,15 @@
 @interface CBL_ForestDBStorage : NSObject <CBL_Storage>
 
 @property (nonatomic, readonly) NSString* directory;
-@property (nonatomic, readonly) void* forestDatabase; // really forestdb::Database*
+@property (nonatomic, readonly) BOOL readOnly;
+@property (nonatomic, readonly) void* forestDatabase; // really C4Database*
+@property (nonatomic) CBLSymmetricKey* encryptionKey;
 
 /** Loads revision given its sequence. Assumes the given docID is valid. */
-- (CBL_MutableRevision*) getDocumentWithID: (NSString*)docID
-                                  sequence: (SequenceNumber)sequence
-                                    status: (CBLStatus*)outStatus;
+- (NSDictionary*) getBodyWithID: (NSString*)docID
+                       sequence: (SequenceNumber)sequence
+                         status: (CBLStatus*)outStatus;
 
-- (CBLStatus) _try: (CBLStatus(^)())block;
+- (void) forgetViewStorageNamed: (NSString*)viewName;
 
 @end

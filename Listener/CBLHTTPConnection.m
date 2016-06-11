@@ -16,19 +16,32 @@
 //  Based on CocoaHTTPServer/Samples/PostHTTPServer/MyHTTPConnection.m
 
 #import "CBLHTTPConnection.h"
-#import "CBLHTTPServer.h"
 #import "CBLHTTPResponse.h"
-#import "CBLListener.h"
+#import "CBLListener+Internal.h"
 #import "CBL_Server.h"
 #import "CBL_Router.h"
 
 #import "HTTPMessage.h"
 #import "HTTPDataResponse.h"
+#import "GCDAsyncSocket.h"
 
+#import "MYErrorUtils.h"
 #import "Test.h"
 
 
+// For some reason this is not declared in HTTPConnection's @interface
+@interface HTTPConnection () <GCDAsyncSocketDelegate>
+@end
+
+
 @implementation CBLHTTPConnection
+{
+    BOOL _hasClientCert;
+    NSURL* _remoteURL;
+    BOOL _builtRemoteURL;
+}
+
+@synthesize username=_username;
 
 
 - (CBLListener*) listener {
@@ -36,16 +49,62 @@
 }
 
 
+- (SSLAuthenticate)sslClientSideAuthentication {
+    return kTryAuthenticate;
+}
+
+static void evaluate(SecTrustRef trust, SecTrustCallback callback) {
+    if (trust)
+        SecTrustEvaluateAsync(trust, dispatch_get_main_queue(), callback);
+    else
+        callback(trust, kSecTrustResultInvalid);
+}
+
+- (void)socket:(GCDAsyncSocket *)sock
+        didReceiveTrust:(SecTrustRef)trust
+        completionHandler:(void (^)(BOOL shouldTrustPeer))completionHandler
+{
+    // This only gets called if the SSL settings disable regular cert validation.
+    evaluate(trust, ^(SecTrustRef trustRef, SecTrustResultType result)
+    {
+        LogTo(Listener, @"Login attempted with%@ client cert; trust result = %d",
+              (trust ? @"" : @"out"), result);
+        id<CBLListenerDelegate> delegate = self.listener.delegate;
+        BOOL ok;
+        if (result == kSecTrustResultDeny || result == kSecTrustResultFatalTrustFailure
+                                          || result == kSecTrustResultOtherError) {
+            ok = NO;
+        } else if ([delegate respondsToSelector: @selector(authenticateConnectionFromAddress:withTrust:)]) {
+            _username = [delegate authenticateConnectionFromAddress: sock.connectedAddress
+                                                          withTrust: trust];
+            ok = (_username != nil);
+        } else {
+            ok = (result == kSecTrustResultProceed || result == kSecTrustResultUnspecified
+                                                   || result == kSecTrustResultInvalid);
+            // kSecTrustResultInvalid means there's no TrustRef, i.e. no client cert. OK by default.
+        }
+        _hasClientCert = (trustRef != nil) && ok;
+        completionHandler(ok);
+    });
+}
+
 - (BOOL)isPasswordProtected:(NSString *)path {
-    return self.listener.requiresAuth;
+    return !_hasClientCert && self.listener.requiresAuth;
 }
 
 - (NSString*) realm {
     return self.listener.realm;
 }
 
+- (BOOL)useDigestAccessAuthentication {
+    // CBL/.NET doesn't support digest auth on the client side, so turn it off, as long as the
+    // connection is SSL (Basic auth is too insecure to use over an unencrypted connection.) #784
+    return !self.isSecureServer;
+}
+
 - (NSString*) passwordForUser: (NSString*)username {
-    LogTo(CBLListener, @"Login attempted for user '%@'", username);
+    LogTo(Listener, @"Login attempted for user '%@'", username);
+    _username = username;
     return [self.listener passwordForUser: username];
 }
 
@@ -54,11 +113,38 @@
 }
 
 - (NSArray *)sslIdentityAndCertificates {
-    NSMutableArray* result = [NSMutableArray arrayWithObject: (__bridge id)self.listener.SSLIdentity];
-    NSArray* certs = self.listener.SSLExtraCertificates;
-    if (certs.count)
-        [result addObjectsFromArray: certs];
-    return result;
+    return self.listener.SSLIdentityAndCertificates;
+}
+
+
+- (NSURL*) remoteURL {
+    if (!_builtRemoteURL) {
+        NSString* addr = asyncSocket.connectedHost;
+        if (![addr isEqualToString: @"127.0.0.1"]  && ![addr isEqualToString: @"::1"]) {
+            if ([addr rangeOfString: @":"].length > 0)
+                addr = $sprintf(@"[%@]", addr);     // RFC 2732
+
+            NSURLComponents* c = [NSURLComponents new];
+            c.scheme = self.isSecureServer ? @"https" : @"http";
+            c.host = addr;
+            c.user = _username;
+            c.path = @"/";
+            _remoteURL = c.URL;
+        }
+        _builtRemoteURL = YES;
+    }
+    return _remoteURL;
+}
+
+
+- (void) socketDidDisconnect: (GCDAsyncSocket*)socket withError: (NSError*)error {
+    if (error && ![error my_hasDomain: GCDAsyncSocketErrorDomain
+                                 code: GCDAsyncSocketClosedError]
+              && ![error my_hasDomain: GCDAsyncSocketErrorDomain
+                                 code: GCDAsyncSocketReadTimeoutError]) {
+        Warn(@"CBLHTTPConnection: Client disconnected: %@", error.my_compactDescription);
+    }
+    [super socketDidDisconnect: socket withError: error];
 }
 
 
@@ -71,9 +157,9 @@
 
 - (NSObject<HTTPResponse>*)httpResponseForMethod:(NSString *)method URI:(NSString *)path {
     if (requestContentLength > 0)
-        LogTo(CBLListener, @"%@ %@ {+%u}", method, path, (unsigned)requestContentLength);
+        LogTo(Listener, @"%@ %@ {+%u}", method, path, (unsigned)requestContentLength);
     else
-        LogTo(CBLListener, @"%@ %@", method, path);
+        LogTo(Listener, @"%@ %@", method, path);
     
     // Construct an NSURLRequest from the HTTPRequest:
     NSMutableURLRequest* urlRequest = [NSMutableURLRequest requestWithURL: request.url];
@@ -84,10 +170,12 @@
         [urlRequest setValue: headers[header] forHTTPHeaderField: header];
     
     // Create a CBL_Router:
-    CBL_Router* router = [[CBL_Router alloc] initWithServer: ((CBLHTTPServer*)config.server).tdServer
+    CBL_Router* router = [[CBL_Router alloc] initWithServer: ((CBLHTTPServer*)config.server).cblServer
                                                 request: urlRequest
                                                 isLocal: NO];
     router.processRanges = NO;  // The HTTP server framework does this already
+    router.source = self.remoteURL;
+
     CBLHTTPResponse* response = [[CBLHTTPResponse alloc] initWithRouter: router
                                                          forConnection: self];
     
@@ -117,5 +205,14 @@
 		Warn(@"CBLHTTPConnection: couldn't append data chunk");
 }
 
+
+@end
+
+
+
+
+@implementation CBLHTTPServer
+
+@synthesize listener=_listener, cblServer=_cblServer;
 
 @end

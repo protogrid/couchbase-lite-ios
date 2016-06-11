@@ -9,6 +9,7 @@
 #import "CBLTestCase.h"
 #import "CBLChangeTracker.h"
 #import "CBLChangeMatcher.h"
+#import "CBLRemoteRequest.h"
 #import "CBLAuthorizer.h"
 #import "CBLInternal.h"
 #import "MYURLUtils.h"
@@ -29,39 +30,84 @@
 {
     NSMutableArray* _changes;
     BOOL _running, _finished;
+    BOOL _gotHeaders;
 }
 
 - (void) test_Simple {
     for (CBLChangeTrackerMode mode = kOneShot; mode <= kLongPoll; ++mode) {
-        Log(@"Mode = %d ...", mode);
-        NSURL* url = [self remoteTestDBURL: @"attach_test"];
-        if (!url)
-            return;
-        CBLChangeTracker* tracker = [[CBLChangeTracker alloc] initWithDatabaseURL: url mode: mode conflicts: NO lastSequence: nil client: self];
-        NSArray* expected = $array($dict({@"seq", @1},
+        for (int activeOnly = 0; activeOnly <= 1; ++activeOnly) {
+            Log(@"Mode = %d, activeOnly=%d ...", mode, activeOnly);
+            NSURL* url = [self remoteNonSSLTestDBURL: @"attach_test"];
+            if (!url)
+                return;
+            CBLChangeTracker* tracker = [[CBLChangeTracker alloc] initWithDatabaseURL: url mode: mode conflicts: NO lastSequence: nil client: self];
+            tracker.activeOnly = (BOOL)activeOnly;
+            NSMutableArray* expected = $marray(
+                                   $dict({@"seq", @1},
                                          {@"id", @"_user/GUEST"},
                                          {@"revs", $array()}),
                                    $dict({@"seq", @2},
                                          {@"id", @"oneBigAttachment"},
-                                         {@"revs", $array(@"2-7a9086d57651b86882d4806bad25903c")}),
+                                         {@"revs", $array(@"2-7a9086d57651b86882d4806bad25903c".cbl_asRevID)}),
                                    $dict({@"seq", @3},
                                          {@"id", @"038c536dc29ff0f4127705879700062c"},
-                                         {@"revs", $array(@"3-e715bcf1865f8283ab1f0ba76e7a92ba")}),
+                                         {@"revs", $array(@"3-e715bcf1865f8283ab1f0ba76e7a92ba".cbl_asRevID)}),
                                    $dict({@"seq", @4},
                                          {@"id", @"propertytest"},
-                                         {@"revs", $array(@"2-61de0ad4b61a3106195e9b21bcb69d0c")},
+                                         {@"revs", $array(@"2-61de0ad4b61a3106195e9b21bcb69d0c".cbl_asRevID)},
                                          {@"deleted", @YES}),
                                    $dict({@"seq", @5},
                                          {@"id", @"extrameta"},
-                                         {@"revs", $array(@"1-11d28a27038a6cce1f08674ab3d67653")}),
+                                         {@"revs", $array(@"1-11d28a27038a6cce1f08674ab3d67653".cbl_asRevID)}),
                                    $dict({@"seq", @6},
                                          {@"id", @"weirdmeta"},
-                                         {@"revs", $array(@"1-eef1e19e2aa822dc3f1c62196cbe6746")}),
+                                         {@"revs", $array(@"1-eef1e19e2aa822dc3f1c62196cbe6746".cbl_asRevID)}),
                                    $dict({@"seq", @7},
                                          {@"id", @"text_attachment"},
-                                         {@"revs", $array(@"2-116dc4ccc934971ae14d8a8afb29b023")})
+                                         {@"revs", $array(@"2-116dc4ccc934971ae14d8a8afb29b023".cbl_asRevID)})
                                    );
-        [self run: tracker expectingChanges: expected];
+            if (activeOnly)
+                [expected removeObjectAtIndex: 3];
+            [self run: tracker expectingChanges: expected];
+            Assert(_gotHeaders);
+        }
+    }
+}
+
+
+- (void) test_DocIDs {
+    for (CBLChangeTrackerMode mode = kOneShot; mode <= kLongPoll; ++mode) {
+        if (mode == kLongPoll)  //FIX: SG doesn't support _doc_ids filter in longpoll mode: SG#1703
+            continue;
+        for (int activeOnly = 0; activeOnly <= 1; ++activeOnly) {
+            Log(@"Mode = %d, activeOnly=%d ...", mode, activeOnly);
+            NSURL* url = [self remoteNonSSLTestDBURL: @"attach_test"];
+            if (!url)
+                return;
+            CBLChangeTracker* tracker = [[CBLChangeTracker alloc] initWithDatabaseURL: url mode: mode conflicts: NO lastSequence: nil client: self];
+            tracker.docIDs = @[@"oneBigAttachment", @"weirdmeta", @"propertytest"];
+            tracker.activeOnly = (BOOL)activeOnly;
+            NSMutableArray* expected = $marray(
+                                   $dict({@"seq", @2},
+                                         {@"id", @"oneBigAttachment"},
+                                         {@"revs", $array(@"2-7a9086d57651b86882d4806bad25903c".cbl_asRevID)}),
+#if 0 // FIX: commented out because SG doesn't correctly handle deleted docs; see issue SG#1702
+                                   $dict({@"seq", @4},
+                                         {@"id", @"propertytest"},
+                                         {@"revs", $array(@"2-61de0ad4b61a3106195e9b21bcb69d0c".cbl_asRevID)},
+                                         {@"deleted", @YES}),
+#endif
+                                   $dict({@"seq", @6},
+                                         {@"id", @"weirdmeta"},
+                                         {@"revs", $array(@"1-eef1e19e2aa822dc3f1c62196cbe6746".cbl_asRevID)})
+                                   );
+#if 0 // FIX: See above
+            if (activeOnly)
+                [expected removeObjectAtIndex: 1];
+#endif
+            [self run: tracker expectingChanges: expected];
+            Assert(_gotHeaders);
+        }
     }
 }
 
@@ -71,10 +117,12 @@
     NSURL* url = [self remoteSSLTestDBURL: @"public"];
     if (!url)
         return;
-    CBLChangeTracker* tracker = [[CBLChangeTracker alloc] initWithDatabaseURL: url mode: kOneShot conflicts: NO lastSequence: 0 client:  self];
-    [self run: tracker expectingError: [NSError errorWithDomain: NSURLErrorDomain
-                                                             code:NSURLErrorServerCertificateUntrusted
-                                                         userInfo: nil]];
+    CBLChangeTracker* tracker = [[CBLChangeTracker alloc] initWithDatabaseURL: url mode: kOneShot conflicts: NO lastSequence: 0 client: self];
+    [self allowWarningsIn:^{
+        [self run: tracker expectingError: [NSError errorWithDomain: NSURLErrorDomain
+                                                                 code:NSURLErrorServerCertificateUntrusted
+                                                             userInfo: nil]];
+    }];
 }
 
 - (void) test_SSL_Part2_Success {
@@ -92,23 +140,24 @@
     CBLChangeTracker* tracker = [[CBLChangeTracker alloc] initWithDatabaseURL: url mode: kOneShot conflicts: NO lastSequence: 0 client:  self];
     NSArray* expected = $array($dict({@"seq", @8},
                                      {@"id", @"foo"},
-                                     {@"revs", $array(@"1-a154bf18a4d64ee6d93b6cc838b2b344")}),
+                                     {@"revs", $array(@"1-a154bf18a4d64ee6d93b6cc838b2b344".cbl_asRevID)}),
                                $dict({@"seq", @9},
                                      {@"id", @"bar"},
-                                     {@"revs", $array(@"1-a7a0e83c48d20397aed5703a06c01ea8")}),
+                                     {@"revs", $array(@"1-a7a0e83c48d20397aed5703a06c01ea8".cbl_asRevID)}),
                                $dict({@"seq", @11},
                                      {@"id", @"_user/GUEST"},
                                      {@"revs", $array()}),
                                );
     [self run: tracker expectingChanges: expected];
     Assert(self.checkedAnSSLCert);
+    Assert(_gotHeaders);
 }
 
 
 - (void) test_Auth {
     RequireTestCase(AuthFailure);
     // This database requires authentication to access at all.
-    NSURL* url = [self remoteTestDBURL: @"cbl_auth_test"];
+    NSURL* url = [self remoteNonSSLTestDBURL: @"cbl_auth_test"];
     if (!url)
         return;
 
@@ -120,13 +169,15 @@
                                      {@"revs", @[]}),
                                $dict({@"seq", @2},
                                      {@"id", @"something"},
-                                     {@"revs", $array(@"1-53b059eb633a9d58042318e478cc73dc")}) );
+                                     {@"revs", $array(@"1-53b059eb633a9d58042318e478cc73dc".cbl_asRevID)}) );
     [self run: tracker expectingChanges: expected];
+    RemoveTemporaryCredential(url, @"Couchbase Sync Gateway", @"test", @"abc123");
+    Assert(_gotHeaders);
 }
 
 
 - (void) test_AuthFailure {
-    NSURL* url = [self remoteTestDBURL: @"cbl_auth_test"];
+    NSURL* url = [self remoteNonSSLTestDBURL: @"cbl_auth_test"];
     if (!url)
         return;
     // Add a bogus user to make auth fail:
@@ -135,29 +186,30 @@
     url = $url(urlStr);
 
     CBLChangeTracker* tracker = [[CBLChangeTracker alloc] initWithDatabaseURL: url mode: kOneShot conflicts: NO lastSequence: 0 client:  self];
-    [self run: tracker expectingError: CBLStatusToNSError(kCBLStatusUnauthorized, url)];
+    [self allowWarningsIn: ^{
+        [self run: tracker expectingError: CBLStatusToNSErrorWithInfo(kCBLStatusUnauthorized,
+                                                                      nil, url, nil)];
+    }];
 }
 
 
 - (void) test_CBLWebSocketChangeTracker_Auth {
     // This Sync Gateway database requires authentication to access at all.
-    NSURL* url = [self remoteTestDBURL: @"cbl_auth_test"];
+    NSURL* url = [self remoteNonSSLTestDBURL: @"cbl_auth_test"];
     if (!url) {
         Warn(@"Skipping test; no remote DB URL configured");
         return;
     }
     CBLChangeTracker* tracker = [[CBLChangeTracker alloc] initWithDatabaseURL: url mode: kWebSocket conflicts: NO lastSequence: 0 client:  self];
 
-    NSURLCredential* c = [NSURLCredential credentialWithUser: @"test" password: @"abc123"
-                                                 persistence: NSURLCredentialPersistenceForSession];
-    tracker.authorizer = [[CBLBasicAuthorizer alloc] initWithCredential: c];
+    tracker.authorizer = [[CBLPasswordAuthorizer alloc] initWithUser: @"test" password: @"abc123"];
 
     NSArray* expected = $array($dict({@"seq", @1},
                                      {@"id", @"_user/test"},
                                      {@"revs", $array()}) ,
                                $dict({@"seq", @2},
                                      {@"id", @"something"},
-                                     {@"revs", $array(@"1-53b059eb633a9d58042318e478cc73dc")}) );
+                                     {@"revs", $array(@"1-53b059eb633a9d58042318e478cc73dc".cbl_asRevID)}) );
     [self run: tracker expectingChanges: expected];
 }
 
@@ -209,6 +261,7 @@
 - (void) run: (CBLChangeTracker*)tracker expectingChanges: (NSArray*)expectedChanges {
     [tracker start];
     _running = YES;
+    _changes = nil;
     NSDate* timeout = [NSDate dateWithTimeIntervalSinceNow: 10];
     while (_running && _changes.count < expectedChanges.count
            && [timeout timeIntervalSinceNow] > 0
@@ -231,6 +284,7 @@
 - (void) run: (CBLChangeTracker*)tracker expectingError: (NSError*)error {
     [tracker start];
     _running = YES;
+    _changes = nil;
     NSDate* timeout = [NSDate dateWithTimeIntervalSinceNow: 60];
     while (_running && [timeout timeIntervalSinceNow] > 0
            && [[NSRunLoop currentRunLoop] runMode: NSDefaultRunLoopMode
@@ -239,6 +293,11 @@
     Assert(!_running, @"-changeTrackerStoped: wasn't called");
     AssertEqual(tracker.error.domain, error.domain);
     AssertEq(tracker.error.code, error.code);
+}
+
+- (void) changeTrackerReceivedHTTPHeaders:(NSDictionary *)headers {
+    _gotHeaders = YES;
+    Assert([headers[@"Server"] hasPrefix: @"Couchbase Sync Gateway"]);
 }
 
 - (void) changeTrackerReceivedSequence:(id)sequence

@@ -9,7 +9,10 @@
 #import "CBL_Storage.h"
 #import "CBLDatabase.h"
 @class CBLQueryOptions, CBLView, CBLQueryRow, CBL_BlobStore, CBLDocument, CBLCache, CBLDatabase,
-       CBLDatabaseChange, CBL_Shared, CBLModelFactory;
+       CBLDatabaseChange, CBL_Shared, CBLModelFactory, CBLDatabaseOptions;
+
+
+UsingLogDomain(Database);
 
 
 // Default value for maxRevTreeDepth, the max rev depth to preserve in a prune operation
@@ -82,6 +85,7 @@ extern NSArray* CBL_RunloopModes;
 + (instancetype) createEmptyDBAtPath: (NSString*)path;
 #endif
 - (BOOL) open: (NSError**)outError;
+- (BOOL) openWithOptions: (CBLDatabaseOptions*)options error: (NSError**)outError;
 - (void) _close; // closes without saving CBLModels.
 
 + (void) setAutoCompact: (BOOL)autoCompact;
@@ -100,20 +104,24 @@ extern NSArray* CBL_RunloopModes;
 
 // DOCUMENTS:
 
-
 - (CBL_Revision*) getDocumentWithID: (NSString*)docID
-                         revisionID: (NSString*)revID
+                         revisionID: (CBL_RevID*)revID
                            withBody: (BOOL)withBody
                              status: (CBLStatus*)outStatus;
 #if DEBUG // convenience method for tests
 - (CBL_Revision*) getDocumentWithID: (NSString*)docID
-                         revisionID: (NSString*)revID;
+                         revisionID: (CBL_RevID*)revID;
 #endif
 
 - (CBLStatus) loadRevisionBody: (CBL_MutableRevision*)rev;
 - (CBL_Revision*) revisionByLoadingBody: (CBL_Revision*)rev
                                  status: (CBLStatus*)outStatus;
 - (SequenceNumber) getRevisionSequence: (CBL_Revision*)rev;
+
+// HISTORY:
+
+- (NSArray<CBL_RevID*>*) getRevisionHistory: (CBL_Revision*)rev
+                               backToRevIDs: (NSArray<CBL_RevID*>*)ancestorRevIDs;
 
 // VIEWS & QUERIES:
 
@@ -122,15 +130,11 @@ extern NSArray* CBL_RunloopModes;
 
 - (void) forgetViewNamed: (NSString*)name;
 
-/** Returns the value of an _all_docs query, as an array of CBLQueryRow. */
-- (CBLQueryIteratorBlock) getAllDocs: (CBLQueryOptions*)options
-                              status: (CBLStatus*)outStatus;
+/** Returns the value of an _all_docs query, as an enumerator of CBLQueryRow. */
+- (CBLQueryEnumerator*) getAllDocs: (CBLQueryOptions*)options
+                            status: (CBLStatus*)outStatus;
 
 - (CBLView*) makeAnonymousView;
-
-- (id) getDesignDocFunction: (NSString*)fnName
-                        key: (NSString*)key
-                   language: (NSString**)outLanguage;
 
 //@property (readonly) NSArray* allViews;
 
@@ -140,7 +144,7 @@ extern NSArray* CBL_RunloopModes;
                                     params: (NSDictionary*)filterParams
                                     status: (CBLStatus*)outStatus;
 
-- (CBLFilterBlock) compileFilterNamed: (NSString*)filterName status: (CBLStatus*)outStatus;
+- (CBLFilterBlock) loadFilterNamed: (NSString*)filterName status: (CBLStatus*)outStatus;
 
 - (BOOL) runFilter: (CBLFilterBlock)filter
             params: (NSDictionary*)filterParams
@@ -149,5 +153,7 @@ extern NSArray* CBL_RunloopModes;
 /** Post an NSNotification. handles if the database is running on a separate dispatch_thread
  (issue #364). */
 - (void) postNotification: (NSNotification*)notification;
+
+- (void) setExpirationDate: (NSDate*)date ofDocument: (NSString*)documentID;
 
 @end

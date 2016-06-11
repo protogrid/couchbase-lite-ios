@@ -16,6 +16,7 @@
 //  http://tools.ietf.org/html/rfc2046#section-5.1
 
 #import "CBLMultipartReader.h"
+#import "CBLByteBuffer.h"
 
 #import "CollectionUtils.h"
 #import "Test.h"
@@ -63,7 +64,7 @@ static NSData* kCRLFCRLF;
             return nil;
         }
         _delegate = delegate;
-        _buffer = [[NSMutableData alloc] initWithCapacity: 1024];
+        _buffer = [[CBLByteBuffer alloc] init];
         _state = kAtStart;
     }
     return self;
@@ -136,23 +137,17 @@ static NSData* kCRLFCRLF;
 }
 
 
-- (NSRange) searchFor: (NSData*)pattern from: (NSUInteger)start {
-    return [_buffer rangeOfData: pattern
-                        options: 0
-                          range: NSMakeRange(start, _buffer.length-start)];
-}
-
 - (void) deleteUpThrough: (NSRange)r {
-    [_buffer replaceBytesInRange: NSMakeRange(0, NSMaxRange(r)) withBytes: NULL length: 0];
+    [_buffer advance:NSMaxRange(r)];
 }
 
 - (BOOL) appendAndTrimBuffer {
-    NSUInteger bufLen = _buffer.length;
+    NSUInteger bufLen = _buffer.bytesAvailable;
     NSUInteger boundaryLen = _boundary.length;
     if (bufLen > boundaryLen) {
         // Leave enough bytes in _buffer that we can find an incomplete boundary string
         NSRange trim = NSMakeRange(0, bufLen - boundaryLen);
-        if (![_delegate appendToPart: [_buffer subdataWithRange: trim]])
+        if (![_delegate appendToPart: [_buffer subdataWithRangeNoCopy: trim]])
             return NO;
         [self deleteUpThrough: trim];
     }
@@ -187,7 +182,7 @@ static NSData* kCRLFCRLF;
     int nextState;
     do {
         nextState = -1;
-        NSUInteger bufLen = _buffer.length;
+        NSUInteger bufLen = _buffer.bytesAvailable;
         id<CBLMultipartReaderDelegate> delegate = _delegate;
         switch (_state) {
             case kAtStart: {
@@ -195,8 +190,7 @@ static NSData* kCRLFCRLF;
                 NSUInteger testLen = _boundary.length - 2;
                 if (bufLen >= testLen) {
                     if (memcmp(_buffer.bytes, _boundary.bytes + 2, testLen) == 0) {
-                        [_buffer replaceBytesInRange: NSMakeRange(0, testLen)
-                                           withBytes: NULL length: 0];
+                        [_buffer advance:testLen];
                         nextState = kInHeaders;
                     } else {
                         nextState = kInPrologue;
@@ -211,11 +205,11 @@ static NSData* kCRLFCRLF;
                 if (bufLen < _boundary.length)
                     break;
                 NSInteger start = MAX(0, (NSInteger)(bufLen - newDataLen - _boundary.length));
-                NSRange r = [self searchFor: _boundary from: start];
+                NSRange r = [_buffer searchFor: _boundary from: start];
                 if (r.length > 0) {
                     if (_state == kInBody) {
                         __unused id retainSelf = self;
-                        if (![delegate appendToPart: [_buffer subdataWithRange: NSMakeRange(0, r.location)]]
+                        if (![delegate appendToPart: [_buffer subdataWithRangeNoCopy: NSMakeRange(0, r.location)]]
                                 || ![delegate finishedPart]) {
                             [self stop];
                             break;
@@ -240,7 +234,7 @@ static NSData* kCRLFCRLF;
                     return;
                 }
                 // Otherwise look for two CRLFs that delimit the end of the headers:
-                NSRange r = [self searchFor: kCRLFCRLF from: 0];
+                NSRange r = [_buffer searchFor: kCRLFCRLF from: 0];
                 if (r.length > 0) {
                     NSString* headers = [[NSString alloc] initWithBytesNoCopy: (void*)_buffer.bytes
                                                                        length: r.location
@@ -265,7 +259,7 @@ static NSData* kCRLFCRLF;
         }
         if (nextState > 0)
             _state = nextState;
-    } while (nextState >= 0 && _buffer.length > 0);
+    } while (nextState >= 0 && _buffer.hasBytesAvailable);
 }
 
 

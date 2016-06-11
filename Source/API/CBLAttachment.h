@@ -32,15 +32,25 @@ NS_ASSUME_NONNULL_BEGIN
 /** The length in bytes of the contents. */
 @property (readonly) UInt64 length;
 
-/** The CouchbaseLite metadata about the attachment, that lives in the document. */
+/** The length in bytes of the encoded form of the attachment.
+    This may be smaller than the length if the attachment is stored in compressed form. */
+@property (readonly) UInt64 encodedLength;
+
+/** The Couchbase Lite metadata about the attachment, that lives in the document. */
 @property (readonly) CBLJSONDict* metadata;
+
+/** Is the content locally available? This may be NO if the attachment's document was pulled
+    from a remote database by a CBLReplication whose downloadAttachments property was NO.
+    If so, the content accessors will return nil. The attachment can be downloaded by calling
+    the replication's -downloadAttachment:onProgress: method. */
+@property (readonly) BOOL contentAvailable;
 
 /** The data of the attachment. */
 @property (readonly, nullable) NSData* content;
 
 /** Returns a stream from which you can read the data of the attachment.
     Remember to close it when you're done. */
-- (NSInputStream*) openContentStream;
+- (nullable NSInputStream*) openContentStream;
 
 /** The (file:) URL of the file containing the contents.
     This property is somewhat deprecated and is made available only for use with platform APIs that
@@ -50,6 +60,11 @@ NS_ASSUME_NONNULL_BEGIN
     If the database is encrypted, attachment files are also encrypted and not directly readable,
     so this property will return nil. */
 @property (readonly, nullable) NSURL* contentURL;
+
+/** Deletes the attachment's contents from local storage. If the attachment is still available on
+    a remote server, it can be restored by calling -[CBLReplication downloadAttachment:onProgress:].
+ */
+- (BOOL) purge;
 
 - (instancetype) init NS_UNAVAILABLE;
 

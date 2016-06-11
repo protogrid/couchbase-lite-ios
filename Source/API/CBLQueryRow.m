@@ -15,7 +15,9 @@
 
 #import "CBLQuery.h"
 #import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLView+Internal.h"
+#import "CBLArrayDiff.h"
 
 
 static id fromJSON( NSData* json ) {
@@ -24,6 +26,16 @@ static id fromJSON( NSData* json ) {
     return [CBLJSON JSONObjectWithData: json
                                options: CBLJSONReadingAllowFragments
                                  error: NULL];
+}
+
+
+BOOL CBLQueryRowValueIsEntireDoc(id value) {
+    static NSData* kEntireDocPlaceholder;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        kEntireDocPlaceholder = [NSData dataWithBytes: "*" length: 1];
+    });
+    return [value isEqual: kEntireDocPlaceholder];
 }
 
 
@@ -48,19 +60,18 @@ static id fromJSON( NSData* json ) {
                            key: (id)key
                          value: (id)value
                    docRevision: (CBL_Revision*)docRevision
-                       storage: (id<CBL_QueryRowStorage>)storage
 {
     self = [super init];
     if (self) {
-        // Don't initialize _database yet. I might be instantiated on a background thread (if the
-        // query is async) which has a different CBLDatabase instance than the original caller.
-        // Instead, the database property will be filled in when I'm added to a CBLQueryEnumerator.
         _sourceDocID = [docID copy];
         _sequence = sequence;
         _key = [key copy];
         _value = [value copy];
         _documentRevision = docRevision;
-        _storage = storage;
+        // Don't initialize _database or _storage yet. I might be instantiated on a background
+        // thread (if the query is async) which has a different CBLDatabase instance than the
+        // original caller. Instead, these properties will be filled in when I'm added to a
+        // CBLQueryEnumerator.
     }
     return self;
 }
@@ -68,19 +79,31 @@ static id fromJSON( NSData* json ) {
 
 - (void) _clearDatabase {
     _database = nil;
+    _storage = nil;
 }
 
 
 - (void) moveToDatabase: (CBLDatabase*)database view: (CBLView*)view {
     Assert(database != nil);
-    _database = database;
-    _storage = [view.storage storageForQueryRow: self];
+    if (database != _database) {
+        _database = database;
+        _storage = [view.storage storageForQueryRow: self];
+    }
 }
 
 
 - (BOOL) isNonMagicValue {
-    return _value && !( [_value isKindOfClass: [NSData class]]
-                        && [_storage rowValueIsEntireDoc: _value] );
+    return _value && !CBLQueryRowValueIsEntireDoc(_value);
+}
+
+
+- (BOOL) isValueEqual: (CBLQueryRow*)other {
+    // If values were emitted, compare them. Otherwise we have nothing to go on so check
+    // if _anything_ about the doc has changed (i.e. the sequences are different.)
+    if ([self isNonMagicValue] || [other isNonMagicValue])
+        return $equal(_value, other->_value);
+    else
+        return _sequence == other->_sequence;
 }
 
 
@@ -97,14 +120,30 @@ static id fromJSON( NSData* json ) {
             && $equal(_key, other->_key)
             && $equal(_sourceDocID, other->_sourceDocID)
             && $equal(_documentRevision, other->_documentRevision)) {
-        // If values were emitted, compare them. Otherwise we have nothing to go on so check
-        // if _anything_ about the doc has changed (i.e. the sequences are different.)
-        if ([self isNonMagicValue] || [other isNonMagicValue])
-            return $equal(_value, other->_value);
-        else
-            return _sequence == other->_sequence;
+        return [self isValueEqual: other];
     }
     return NO;
+}
+
+
+- (uint8_t/*CBLDiffItemComparison*/) compareForArrayDiff: (CBLQueryRow*)other {
+    if (_sourceDocID) {
+        if (![_sourceDocID isEqualToString: other->_sourceDocID])
+            return kCBLItemsDifferent;
+        else if (_sequence == other->_sequence)
+            return kCBLItemsEqual;
+        else
+            return kCBLItemsModified;
+
+    } else {
+        // Aggregated (grouped/reduced) row:
+        if (!$equal(_key, other->_key))
+            return kCBLItemsDifferent;
+        else if ([self isValueEqual: other])
+            return kCBLItemsEqual;
+        else
+            return kCBLItemsModified;
+    }
 }
 
 
@@ -126,24 +165,28 @@ static id fromJSON( NSData* json ) {
         value = _value;
         if ([value isKindOfClass: [NSData class]]) {
             // _value may start out as unparsed Collatable data
-            id<CBL_QueryRowStorage> storage = _storage;
-            Assert(storage);
-            if ([storage rowValueIsEntireDoc: _value]) {
+            if (CBLQueryRowValueIsEntireDoc(value)) {
                 // Value is a placeholder ("*") denoting that the map function emitted "doc" as
                 // the value. So load the body of the revision now:
                 if (_documentRevision) {
                     value = _documentRevision.properties;
                 } else {
                     Assert(_sequence);
+                    id<CBL_QueryRowStorage> storage = _storage;
+                    if (!storage) {
+                        Warn(@"CBLQueryRow.value: cannot get the value, the database is gone");
+                        return nil;
+                    }
                     CBLStatus status;
                     value = [storage documentPropertiesWithID: _sourceDocID
                                                      sequence: _sequence
                                                        status: &status];
                     if (!value)
-                        Warn(@"%@: Couldn't load doc for row value: status %d", self, status);
+                        Warn(@"%@[key=%@]: Couldn't load doc for row value: status %d",
+                             self.class, self.key, status);
                 }
             } else {
-                value = [storage parseRowValue: _value];
+                value = fromJSON(_value);
             }
             _parsedValue = value;
         }
@@ -169,16 +212,20 @@ static id fromJSON( NSData* json ) {
 }
 
 
-- (NSString*) documentRevisionID {
+- (CBL_RevID*) _documentRevisionID {
     // Get the revision id from either the embedded document contents,
     // or the '_rev' or 'rev' value key:
     if (_documentRevision)
         return _documentRevision.revID;
     NSDictionary* value = $castIf(NSDictionary, self.value);
-    NSString* rev = value.cbl_rev;
+    CBL_RevID* rev = value.cbl_rev;
     if (value && !rev)
-        rev = $castIf(NSString, value[@"rev"]);
+        rev = $castIf(NSString, value[@"rev"]).cbl_asRevID;
     return rev;
+}
+
+- (NSString*) documentRevisionID {
+    return self._documentRevisionID.asString;
 }
 
 
@@ -238,30 +285,28 @@ static id fromJSON( NSData* json ) {
 }
 
 
-// This is used by the router
-- (NSDictionary*) asJSONDictionary {
-    if (_value || _sourceDocID) {
-        return $dict({@"key", self.key},
-                     {@"value", self.value},
-                     {@"id", _sourceDocID},
-                     {@"doc", self.documentProperties});
-    } else {
-        return $dict({@"key", self.key}, {@"error", @"not_found"});
-    }
-
+static NSString* jsonStr(id o) {
+    if (!o)
+        return nil;
+    return [CBLJSON stringWithJSONObject: o options: CBLJSONWritingAllowFragments error: nil];
 }
 
 
 - (NSString*) description {
-    NSString* valueStr = @"nil";
-    if (self.value)
-        valueStr = [CBLJSON stringWithJSONObject: self.value
-                                         options: CBLJSONWritingAllowFragments error: nil];
     return [NSString stringWithFormat: @"%@[key=%@; value=%@; id=%@]",
-            [self class],
-            [CBLJSON stringWithJSONObject: self.key options: CBLJSONWritingAllowFragments error: nil],
-            valueStr,
-            self.documentID];
+            [self class], jsonStr(self.key), jsonStr(self.value), self.documentID];
+}
+
+
+- (id) debugQuickLookObject {
+    NSMutableString* result = [NSMutableString stringWithFormat: @"Key:   %@\nValue: %@",
+                               jsonStr(self.key), jsonStr(self.value)];
+    if (self.documentID) {
+        [result appendFormat: @"\nDocID: %@", self.documentID];
+        if (_documentRevision)
+            [result appendFormat: @" (rev %@)", _documentRevision];
+    }
+    return result;
 }
 
 

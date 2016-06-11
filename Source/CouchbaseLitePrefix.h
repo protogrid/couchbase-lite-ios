@@ -25,20 +25,18 @@ extern "C" {
 
 #import "CBLJSON.h"
 
+//#define MY_DISABLE_LOGGING    // Uncomment this to prevent Log calls from generating any code
+
+#define MYERRORUTILS_USE_SECURITY_API 1     // Tell MYErrorUtils it can look up Security messages
+
 #import "CollectionUtils.h"
-#import "Logging.h"
+#import "MYLogging.h"
 #import "Test.h"
 
 #ifdef __cplusplus
 }
 #endif
 
-
-// Rename the MYUtilities classes to avoid collisions:
-#define MYDynamicObject             CBL_MYDynamicObject
-
-#define MYClassFromType             CBL_MYClassFromType
-#define MYGetPropertyInfo           CBL_MYGetPropertyInfo
 
 // Rename the GCDAsyncSocket classes to avoid collisions:
 #define GCDAsyncSocket              CBL_GCDAsyncSocket
@@ -55,12 +53,23 @@ extern "C" {
 #define GCDAsyncSocketSSLProtocolVersionMax CBL_GCDAsyncSocketSSLProtocolVersionMax
 #define GCDAsyncSocketSSLProtocolVersionMin CBL_GCDAsyncSocketSSLProtocolVersionMin
 
+#define GCDAsyncSocketManuallyEvaluateTrust CBL_GCDAsyncSocketManuallyEvaluateTrust
+#define GCDAsyncSocketUseCFStreamForTLS     CBL_GCDAsyncSocketUseCFStreamForTLS
+#define GCDAsyncSocketSSLPeerID             CBL_GCDAsyncSocketSSLPeerID
+#define GCDAsyncSocketSSLSessionOptionFalseStart        CBL_GCDAsyncSocketSSLSessionOptionFalseStart
+#define GCDAsyncSocketSSLSessionOptionSendOneByteRecord CBL_GCDAsyncSocketSSLSessionOptionSendOneByteRecord
+
 // Rename the CocoaLumberjack classes to avoid collisions:
 #define DDLog                       CBL_DDLog
 #define DDLogMessage                CBL_DDLogMessage
 #define DDAbstractLogger            CBL_DDAbstractLogger
 #define DDLoggerNode                CBL_DDLoggerNode
 #define DDExtractFileNameWithoutExtension CBL_DDExtractFileNameWithoutExtension
+#define DDUnionRange                CBL_DDUnionRange
+#define DDIntersectionRange         CBL_DDIntersectionRange
+#define DDStringFromRange           CBL_DDStringFromRange
+#define DDRangeFromString           CBL_DDRangeFromString
+#define DDRangeCompare              CBL_DDRangeCompare
 
 // Rename the CocoaHTTPServer classes to avoid collisions:
 #define HTTPAsyncFileResponse       CBL_HTTPAsyncFileResponse

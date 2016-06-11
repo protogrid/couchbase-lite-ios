@@ -13,12 +13,30 @@
 //  either express or implied. See the License for the specific language governing permissions
 //  and limitations under the License.
 
-#import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLQuery+FullTextSearch.h"
 #import "CBLView+Internal.h"
 
 
 static NSUInteger utf8BytesToChars(const void* bytes, NSUInteger byteStart, NSUInteger byteEnd);
+
+
+@interface CBLFTSMatch : NSObject
+{
+    @public
+    NSUInteger term;
+    NSRange textRange;
+}
+@end
+
+@implementation CBLFTSMatch
+
+- (NSComparisonResult) compare: (CBLFTSMatch*)other {
+    return (NSInteger)textRange.location - (NSInteger)other->textRange.location;
+}
+
+@end
+
 
 
 @implementation CBLQuery (FullTextSearch)
@@ -33,41 +51,68 @@ static NSUInteger utf8BytesToChars(const void* bytes, NSUInteger byteStart, NSUI
 @end
 
 
+
 @implementation CBLFullTextQueryRow
 {
     UInt64 _fullTextID;
     NSString* _snippet;
-    NSMutableArray* _matchOffsets;
+    NSMutableArray* _matches;
 }
 
-@synthesize snippet=_snippet;
+@synthesize snippet=_snippet, relevance=_relevance;
 
 - (instancetype) initWithDocID: (NSString*)docID
                       sequence: (SequenceNumber)sequence
                     fullTextID: (UInt64)fullTextID
                          value: (id)value
-                       storage: (id<CBL_QueryRowStorage>)storage
 {
-    self = [super initWithDocID: docID sequence: sequence key: $null value: value
-                  docRevision: nil storage: storage];
+    self = [super initWithDocID: docID sequence: sequence key: $null value: value docRevision: nil];
     if (self) {
         _fullTextID = fullTextID;
-        _matchOffsets = [[NSMutableArray alloc] initWithCapacity: 4];
+        _matches = [[NSMutableArray alloc] initWithCapacity: 4];
     }
     return self;
 }
 
 - (void) addTerm: (NSUInteger)term atRange: (NSRange)range {
-    [_matchOffsets addObject: @"?"]; //FIX
-    [_matchOffsets addObject: @(term)];
-    [_matchOffsets addObject: @(range.location)];
-    [_matchOffsets addObject: @(range.length)];
+    CBLFTSMatch* match = [CBLFTSMatch new];
+    match->term = term;
+    match->textRange = range;
+    [_matches addObject: match];
 }
 
+
+- (BOOL) containsAllTerms: (NSUInteger)termCount {
+    if (termCount == 1)
+        return YES;
+    BOOL result = NO;
+    if (self.matchCount >= termCount) {
+        CFMutableBitVectorRef seen = CFBitVectorCreateMutable(NULL, termCount);
+        NSUInteger termsSeen = 0;
+        for (CBLFTSMatch* match in _matches) {
+            if (!CFBitVectorGetBitAtIndex(seen, match->term)) {
+                if (++termsSeen == termCount) {
+                    result = YES;
+                    break;
+                }
+                CFBitVectorSetBitAtIndex(seen, match->term, 1);
+            }
+        }
+        CFRelease(seen);
+    }
+    if (result)
+        [_matches sortUsingSelector: @selector(compare:)];
+    return result;
+}
+
+
 - (NSData*) fullTextUTF8Data {
-    return [self.storage fullTextForDocument: self.documentID
-                                    sequence: self.sequenceNumber
-                                  fullTextID: _fullTextID];
+    id<CBL_QueryRowStorage> storage = self.storage;
+    if (!storage)
+        Warn(@"CBLFullTextQueryRow: cannot get the fullText, the database is gone");
+    return [storage fullTextForDocument: self.documentID
+                               sequence: self.sequenceNumber
+                             fullTextID: _fullTextID];
 }
 
 - (NSString*) fullText {
@@ -78,17 +123,20 @@ static NSUInteger utf8BytesToChars(const void* bytes, NSUInteger byteStart, NSUI
 }
 
 - (NSUInteger) matchCount {
-    return _matchOffsets.count / 4;
+    return _matches.count;
 }
 
 - (NSUInteger) termIndexOfMatch: (NSUInteger)matchNumber {
-    return [_matchOffsets[4*matchNumber + 1] unsignedIntegerValue];
+    return ((CBLFTSMatch*)_matches[matchNumber])->term;
 }
 
 - (NSRange) textRangeOfMatch: (NSUInteger)matchNumber {
-    NSUInteger byteStart  = [_matchOffsets[4*matchNumber + 2] unsignedIntegerValue];
-    NSUInteger byteLength = [_matchOffsets[4*matchNumber + 3] unsignedIntegerValue];
+    CBLFTSMatch* match = _matches[matchNumber];
+    NSUInteger byteStart  = match->textRange.location;
+    NSUInteger byteLength = match->textRange.length;
     NSData* rawText = self.fullTextUTF8Data;
+    if (!rawText)
+        return NSMakeRange(NSNotFound, 0);
     return NSMakeRange(utf8BytesToChars(rawText.bytes, 0, byteStart),
                        utf8BytesToChars(rawText.bytes, byteStart, byteStart + byteLength));
 }
@@ -97,35 +145,103 @@ static NSUInteger utf8BytesToChars(const void* bytes, NSUInteger byteStart, NSUI
 - (NSString*) snippetWithWordStart: (NSString*)wordStart
                            wordEnd: (NSString*)wordEnd
 {
-    if (!_snippet)
-        return nil;
-    NSMutableString* snippet = [_snippet mutableCopy];
-    [snippet replaceOccurrencesOfString: @"\001" withString: wordStart
-                                options:NSLiteralSearch range:NSMakeRange(0, snippet.length)];
-    [snippet replaceOccurrencesOfString: @"\002" withString: wordEnd
-                                options:NSLiteralSearch range:NSMakeRange(0, snippet.length)];
-    return snippet;
-}
+    if (_snippet) {
+        NSMutableString* snippet = [_snippet mutableCopy];
+        [snippet replaceOccurrencesOfString: @"\001" withString: wordStart
+                                    options:NSLiteralSearch range:NSMakeRange(0, snippet.length)];
+        [snippet replaceOccurrencesOfString: @"\002" withString: wordEnd
+                                    options:NSLiteralSearch range:NSMakeRange(0, snippet.length)];
+        return snippet;
+    } else {
+        // Generate the snippet myself. This is pretty crude compared to SQLite's algorithm,
+        // which is described at http://sqlite.org/fts3.html#section_4_2
+        NSString* fullText = self.fullText;
+        if (!fullText)
+            return @"";
 
+        // Use an NSLinguisticTagger to tokenize the full text into a list of word char ranges:
+        NSLinguisticTagger* tagger = [[NSLinguisticTagger alloc] initWithTagSchemes:@[NSLinguisticTagSchemeTokenType] options: 0];
+        tagger.string = fullText;
+        NSArray* tokenRanges = nil;
+        [tagger tagsInRange: NSMakeRange(0, fullText.length)
+                     scheme: NSLinguisticTagSchemeTokenType
+                    options: NSLinguisticTaggerOmitPunctuation | NSLinguisticTaggerOmitWhitespace
+                                | NSLinguisticTaggerOmitOther
+                tokenRanges: &tokenRanges];
+        if (!tokenRanges)
+            return nil;
 
-// Overridden to add FTS result info
-- (NSDictionary*) asJSONDictionary {
-    NSMutableDictionary* dict = [[super asJSONDictionary] mutableCopy];
-    if (!dict[@"error"]) {
-        [dict removeObjectForKey: @"key"];
-        if (_snippet)
-            dict[@"snippet"] = [self snippetWithWordStart: @"[" wordEnd: @"]"];
-        if (_matchOffsets) {
-            NSMutableArray* matches = [[NSMutableArray alloc] init];
-            for (NSUInteger i = 0; i < _matchOffsets.count; i += 4) {
-                NSRange r = [self textRangeOfMatch: i/4];
-                [matches addObject: @{@"term": _matchOffsets[i+1],
-                                      @"range": @[@(r.location), @(r.length)]}];
-            }
-            dict[@"matches"] = matches;
+        // Find the indexes (in tokenRanges) of the first and last match:
+        //FIX: It would be better to find a region that includes as many matches as possible.
+        NSUInteger start = [self textRangeOfMatch: 0].location;
+        NSUInteger end = NSMaxRange([self textRangeOfMatch: self.matchCount - 1]);
+        NSInteger startTokenIndex = -1, endTokenIndex = -1;
+        NSUInteger i = 0;
+        for (NSValue* rangeObj in tokenRanges) {
+            NSRange range = rangeObj.rangeValue;
+            if (startTokenIndex < 0 && range.location >= start)
+                startTokenIndex = i;
+            endTokenIndex = i;
+            if (NSMaxRange(range) >= end)
+                break;
+            i++;
         }
+
+        // Try to get exactly the desired number of tokens in the snippet by adjusting start/end:
+        static const NSInteger kMaxTokens = 15;
+        NSInteger addTokens = kMaxTokens - (endTokenIndex-startTokenIndex+1);
+        if (addTokens > 0) {
+            startTokenIndex -= MIN(addTokens/2, startTokenIndex);
+            endTokenIndex = MIN(startTokenIndex + kMaxTokens, (NSInteger)tokenRanges.count - 1);
+            startTokenIndex = MAX(0, endTokenIndex - kMaxTokens);
+        } else {
+            endTokenIndex += addTokens;
+        }
+
+        if (startTokenIndex > 0)
+            --startTokenIndex;      // start the snippet one word before the first match
+
+        // Update the snippet character range to the ends of the tokens:
+        NSString *prefix = @"", *suffix = @"";
+        if (startTokenIndex > 0) {
+            start = [tokenRanges[startTokenIndex] rangeValue].location;
+            prefix = @"…";
+        } else {
+            start = 0;
+        }
+        if ((NSUInteger)endTokenIndex < tokenRanges.count - 1) {
+            end = NSMaxRange([tokenRanges[endTokenIndex] rangeValue]);
+            suffix = @"…";
+        } else {
+            end = fullText.length;
+        }
+
+        NSMutableString *snippet = [[fullText substringWithRange: NSMakeRange(start, end-start)]
+                                        mutableCopy];
+
+        // Wrap matches with caller-supplied strings:
+        if (wordStart || wordEnd) {
+            NSInteger delta = -start;
+            for (NSUInteger i = 0; i < self.matchCount; i++) {
+                NSRange range = [self textRangeOfMatch: i];
+                if (range.location >= start && NSMaxRange(range) <= end) {
+                    if (wordStart) {
+                        [snippet insertString: wordStart atIndex: range.location + delta];
+                        delta += wordStart.length;
+                    }
+                    if (wordEnd) {
+                        [snippet insertString: wordEnd atIndex: NSMaxRange(range) + delta];
+                        delta += wordEnd.length;
+                    }
+                }
+            }
+        }
+
+        // Add ellipses at start/end if necessary:
+        [snippet insertString: prefix atIndex: 0];
+        [snippet appendString: suffix];
+        return snippet;
     }
-    return dict;
 }
 
 

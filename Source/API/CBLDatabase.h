@@ -85,6 +85,19 @@ typedef BOOL (^CBLFilterBlock) (CBLSavedRevision* revision, NSDictionary* __null
     of resetting all replications, making them run slow the next time. */
 - (BOOL) replaceUUIDs: (NSError**)outError;
 
+/** Changes the database's encryption key, or removes encryption if the new key is nil.
+
+    To use this API, the database storage engine must support encryption. In the case of SQLite,
+    this means the application must be linked with SQLCipher <http://sqlcipher.net> instead of
+    regular SQLite. Otherwise opening the database will fail with an error.
+    @param keyOrPassword  The encryption key in the form of an NSString (a password) or an
+                NSData object exactly 32 bytes in length (a raw AES key.) If a string is given,
+                it will be internally converted to a raw key using 64,000 rounds of PBKDF2 hashing.
+                A nil value will decrypt the database.
+    @param error  If an error occurs, it will be stored here if this parameter is non-NULL.
+    @result  YES if the database was successfully re-keyed, or NO on error. */
+- (BOOL) changeEncryptionKey: (nullable id)keyOrPassword
+                       error: (NSError**)error;
 
 #pragma mark - DOCUMENT ACCESS:
 
@@ -102,7 +115,7 @@ typedef BOOL (^CBLFilterBlock) (CBLSavedRevision* revision, NSDictionary* __null
 - (nullable CBLDocument*) existingDocumentWithID: (NSString*)docID;
 
 /** Same as -documentWithID:. Enables "[]" access in Xcode 4.4+ */
-- (CBLDocument*)objectForKeyedSubscript: (NSString*)key;
+- (nullable CBLDocument*)objectForKeyedSubscript: (NSString*)key;
 
 /** Creates a new CBLDocument object with no properties and a new (random) UUID.
     The document will be saved to the database when you call -putProperties: on it. */
@@ -233,6 +246,10 @@ typedef BOOL (^CBLChangeEnumeratorBlock) (NSString* key,
 
 /** The contents of the current revision of the document, or nil if this is a new document. */
 @property (readonly, nullable) CBLSavedRevision* currentRevision;
+
+/** The source of the change: either the URL of the remote database that's being pulled from,
+    or a "user:" URL denoting the user authenticated through the listener's REST API, or nil. */
+@property (readonly, nonatomic) NSURL* source;
 
 /** Rejects the proposed new revision. */
 - (void) reject;

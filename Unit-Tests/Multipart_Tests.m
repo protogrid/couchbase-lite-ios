@@ -11,8 +11,10 @@
 #import "CBLMultipartDocumentReader.h"
 #import "CBLMultipartWriter.h"
 #import "CBLInternal.h"
+#import "CBLRemoteSession.h"
 #import "CBL_BlobStore.h"
-#import "GTMNSData+zlib.h"
+#import "CBL_BlobStoreWriter.h"
+#import "CBLGZip.h"
 
 
 // Another hardcoded DB that needs to exist on the remote test server.
@@ -70,9 +72,9 @@
     urlStr = [urlStr stringByAppendingString: @"/oneBigAttachment?revs=true&attachments=true"];
     NSURL* url = [NSURL URLWithString: urlStr];
     __block BOOL done = NO;
-    [[[CBLMultipartDownloader alloc] initWithURL: url
+    CBLMultipartDownloader* dl;
+    dl = [[CBLMultipartDownloader alloc] initWithURL: url
                                         database: db
-                                  requestHeaders: nil
                                     onCompletion: ^(id result, NSError * error)
       {
           AssertNil(error);
@@ -89,11 +91,14 @@
               Log(@"Found %u bytes of data for attachment %@", (unsigned)blob.length, attachment);
               NSNumber* lengthObj = attachment[@"encoded_length"] ?: attachment[@"length"];
               AssertEq(blob.length, [lengthObj unsignedLongLongValue]);
-              AssertEq(writer.length, blob.length);
+              AssertEq(writer.bytesWritten, blob.length);
           }
           AssertEq(db.attachmentStore.count, attachments.count);
           done = YES;
-      }] start];
+      }];
+    dl.debugAlwaysTrust = YES;
+    CBLRemoteSession* session = [[CBLRemoteSession alloc] init];
+    [session startRequest: dl];
 
     while (!done)
         [[NSRunLoop currentRunLoop] runMode: NSDefaultRunLoopMode beforeDate: [NSDate dateWithTimeIntervalSinceNow: 0.5]];
@@ -116,7 +121,7 @@
     NSDictionary* attachment = (dict[@"_attachments"])[@"mary.txt"];
     CBL_BlobStoreWriter* writer = [db attachmentWriterForAttachment: attachment];
     Assert(writer);
-    AssertEq(writer.length, 52u);
+    AssertEq(writer.bytesWritten, 52u);
 
     mime = [self contentsOfTestFile: @"MultipartBinary.mime"];
     headers = @{@"Content-Type": @"multipart/mixed; boundary=\"dc0bf3cdc9a6c6e4c46fe2a361c8c5d7\""};
@@ -140,11 +145,11 @@
     attachment = (dict[@"_attachments"])[@"Toad.gif"];
     writer = [db attachmentWriterForAttachment: attachment];
     Assert(writer);
-    AssertEq(writer.length, 6566u);
+    AssertEq(writer.bytesWritten, 6566u);
     attachment = (dict[@"_attachments"])[@"want3.jpg"];
     writer = [db attachmentWriterForAttachment: attachment];
     Assert(writer);
-    AssertEq(writer.length, 24758u);
+    AssertEq(writer.bytesWritten, 24758u);
 
     // Read data that's equivalent to the last one except the JSON is gzipped:
     mime = [self contentsOfTestFile: @"MultipartBinary.mime"];
@@ -358,7 +363,7 @@
                                    @"Content-Length": @"24",
                                    @"Content-Type": @"star-bellies"}]));
 
-    NSData* stars = [NSData gtm_dataByInflatingData: _partList[0]];
+    NSData* stars = [CBLGZip dataByDecompressingData: _partList[0]];
     AssertEq(stars.length, 100u);
     for (int i=0; i<100; i++)
         AssertEq(((char*)stars.bytes)[i], '*');

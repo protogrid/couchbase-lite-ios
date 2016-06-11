@@ -19,6 +19,7 @@
 #import "CollectionUtils.h"
 #import "CBJSONEncoder.h"
 #import "CBLJSON.h"
+#import <netdb.h>
 
 
 #ifdef GNUSTEP
@@ -29,6 +30,9 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <CommonCrypto/CommonHMAC.h>
 #endif
+
+
+UsingLogDomain(Database);
 
 
 #if DEBUG
@@ -44,13 +48,17 @@ NSString* CBLPathToTestFile(NSString* name) {
 NSData* CBLContentsOfTestFile(NSString* name) {
     NSError* error;
     NSData* data = [NSData dataWithContentsOfFile: CBLPathToTestFile(name) options:0 error: &error];
-    Assert(data, @"Couldn't read test file '%@': %@", name, error);
+    Assert(data, @"Couldn't read test file '%@': %@", name, error.my_compactDescription);
     return data;
 }
 #endif
 
 
 BOOL CBLWithStringBytes(UU NSString* str, void (^block)(const char*, size_t)) {
+    if (!str) {
+        block(NULL, 0);
+        return YES;
+    }
     // First attempt: Get a C string directly from the CFString if it's in the right format:
     const char* cstr = CFStringGetCStringPtr((CFStringRef)str, kCFStringEncodingUTF8);
     if (cstr) {
@@ -141,6 +149,26 @@ char* CBLAppendHex( char *dst, const void* bytes, size_t length) {
     }
     *dst = '\0';
     return dst;
+}
+
+size_t CBLAppendDecimal(char *str, uint64_t n) {
+    size_t len;
+    if (n < 10) {
+        str[0] = '0' + (char)n;
+        len = 1;
+    } else {
+        char temp[20]; // max length is 20 decimal digits
+        char *dst = &temp[20];
+        len = 0;
+        do {
+            *(--dst) = '0' + (n % 10);
+            n /= 10;
+            len++;
+        } while (n > 0);
+        memcpy(str, dst, len);
+    }
+    str[len] = '\0';
+    return len;
 }
 
 NSString* CBLHexFromBytes( const void* bytes, size_t length) {
@@ -296,13 +324,21 @@ BOOL CBLParseInteger(NSString* str, NSInteger* outInt) {
 BOOL CBLIsOfflineError( NSError* error ) {
     NSString* domain = error.domain;
     NSInteger code = error.code;
-    if ($equal(domain, NSURLErrorDomain))
+    if ($equal(domain, NSURLErrorDomain)) {
         return code == NSURLErrorDNSLookupFailed
             || code == NSURLErrorNotConnectedToInternet
 #ifndef GNUSTEP
             || code == NSURLErrorInternationalRoamingOff
 #endif
         ;
+    } else if ($equal(domain, (__bridge id)kCFErrorDomainCFNetwork)) {
+        if (code == kCFHostErrorUnknown) {
+            int netdbCode = [error.userInfo[(__bridge id)kCFGetAddrInfoFailureKey] intValue];
+            return netdbCode == EAI_NONAME;
+        } else {
+            return code == kCFHostErrorHostNotFound;
+        }
+    }
     return NO;
 }
 
@@ -322,7 +358,8 @@ BOOL CBLIsFileNotFoundError( NSError* error ) {
     NSInteger code = error.code;
     return ($equal(domain, NSPOSIXErrorDomain) && code == ENOENT)
 #ifndef GNUSTEP
-        || ($equal(domain, NSCocoaErrorDomain) && code == NSFileNoSuchFileError)
+        || ($equal(domain, NSCocoaErrorDomain) && (code == NSFileNoSuchFileError ||
+                                                   code == NSFileReadNoSuchFileError))
 #endif
     ;
 }
@@ -334,6 +371,9 @@ BOOL CBLMayBeTransientError( NSError* error ) {
     if ($equal(domain, NSURLErrorDomain)) {
         return code == NSURLErrorTimedOut || code == NSURLErrorCannotConnectToHost
                                           || code == NSURLErrorNetworkConnectionLost;
+    } else if ($equal(domain, NSPOSIXErrorDomain)) {
+        return code == ENETDOWN || code == ENETUNREACH || code == ENETRESET || code == ECONNABORTED
+            || code == ECONNRESET || code == ETIMEDOUT || code == ECONNREFUSED;
     } else if ($equal(domain, CBLHTTPErrorDomain)) {
         // Internal Server Error, Bad Gateway, Service Unavailable or Gateway Timeout:
         return code == 500 || code == 502 || code == 503 || code == 504;
@@ -364,7 +404,7 @@ BOOL CBLIsPermanentError( NSError* error ) {
 BOOL CBLRemoveFileIfExists(NSString* path, NSError** outError) {
     NSError* error;
     if ([[NSFileManager defaultManager] removeItemAtPath: path error: &error]) {
-        LogTo(CBLDatabase, @"Deleted file %@", path);
+        LogTo(Database, @"Deleted file %@", path);
         return YES;
     } else if (CBLIsFileNotFoundError(error)) {
         return YES;
@@ -383,11 +423,11 @@ BOOL CBLRemoveFileIfExistsAsync(NSString* path, NSError** outError) {
                                                           toPath: renamedPath
                                                            error: &error];
     if (result) {
-        LogTo(CBLDatabase, @"Renamed file %@ to %@ for async delete", renamedPath, renamedPath);
+        LogTo(Database, @"Renamed file %@ to %@ for async delete", renamedPath, renamedPath);
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             NSError* outError;
             if (CBLRemoveFileIfExists(renamedPath, &outError))
-                LogTo(CBLDatabase, @"Deleted file %@", renamedPath);
+                LogTo(Database, @"Deleted file %@", renamedPath);
             else
                 Warn(@"Failed to delete an attachment folder at %@ with error: %@",
                      renamedPath, outError);
@@ -416,6 +456,23 @@ BOOL CBLCopyFileIfExists(NSString* atPath, NSString* toPath, NSError** outError)
         }
     } else
         return YES;
+}
+
+
+BOOL CBLSafeReplaceDir(NSString* srcPath, NSString* dstPath, NSError** outError) {
+    NSFileManager* fmgr = [NSFileManager defaultManager];
+    // Define an interim location to move dstPath to, and make sure it's available:
+    NSString* interimPath = [dstPath stringByAppendingString: @"~"];
+    [fmgr removeItemAtPath: interimPath error: NULL];
+
+    if ([fmgr moveItemAtPath: dstPath toPath: interimPath error: outError]) {
+        if ([fmgr moveItemAtPath: srcPath toPath: dstPath error: outError]) {
+            [fmgr removeItemAtPath: interimPath error: NULL];
+            return YES; // success!
+        }
+        [fmgr moveItemAtPath: interimPath toPath: dstPath error: NULL]; // back out
+    }
+    return NO;
 }
 
 
@@ -473,4 +530,33 @@ NSURL* CBLAppendToURL(NSURL* baseURL, NSString* toAppend) {
         [urlStr appendString: @"/"];
     [urlStr appendString: toAppend];
     return [NSURL URLWithString: urlStr];
+}
+
+
+id CBLKeyForPrefixMatch(id key, unsigned depth) {
+    if (depth < 1)
+        return key;
+    if ([key isKindOfClass: [NSString class]]) {
+        // Kludge: prefix match a string by appending max possible character value to it
+        return [key stringByAppendingString: @"\uffffffff"];
+    } else if ([key isKindOfClass: [NSArray class]]) {
+        NSMutableArray* nuKey = [key mutableCopy];
+        if (depth == 1) {
+            [nuKey addObject: @{}];
+        } else {
+            id lastObject = CBLKeyForPrefixMatch(nuKey.lastObject, depth-1);
+            [nuKey replaceObjectAtIndex: nuKey.count-1 withObject: lastObject];
+        }
+        return nuKey;
+    } else {
+        return key;
+    }
+}
+
+
+NSString* CBLStemmerNameForCurrentLocale(void) {
+    // Derive the stemmer language name based on the current locale's language.
+    // For NSLocale language codes see https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
+    // The tokenizer hardcodes language names; see unicodeSetStemmer() in fts3_unicodesn.c.
+    return [[NSLocale currentLocale] objectForKey: NSLocaleLanguageCode];
 }

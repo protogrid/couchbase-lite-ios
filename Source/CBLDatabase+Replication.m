@@ -15,7 +15,7 @@
 
 #import "CBLDatabase+Replication.h"
 #import "CBLInternal.h"
-#import "CBL_Puller.h"
+#import "CBL_Replicator.h"
 #import "MYBlockUtils.h"
 
 
@@ -31,7 +31,7 @@
     return _activeReplicators;
 }
 
-- (void) addActiveReplicator: (CBL_Replicator*)repl {
+- (void) addActiveReplicator: (id<CBL_Replicator>)repl {
     if (!_activeReplicators) {
         _activeReplicators = [[NSMutableArray alloc] init];
         [[NSNotificationCenter defaultCenter] addObserver: self
@@ -44,23 +44,27 @@
 }
 
 
-- (CBL_Replicator*) activeReplicatorLike: (CBL_Replicator*)repl {
-    for (CBL_Replicator* activeRepl in _activeReplicators) {
-        if ([activeRepl hasSameSettingsAs: repl])
+- (id<CBL_Replicator>) activeReplicatorLike: (id<CBL_Replicator>)repl {
+    CBLDatabase* db = repl.db;
+    for (id<CBL_Replicator> activeRepl in _activeReplicators) {
+        if (db == activeRepl.db
+                && repl.settings.isPush == activeRepl.settings.isPush
+                && $equal(repl.remoteCheckpointDocID, activeRepl.remoteCheckpointDocID)) {
             return activeRepl;
+        }
     }
     return nil;
 }
 
 
-- (void) stopAndForgetReplicator: (CBL_Replicator*)repl {
+- (void) stopAndForgetReplicator: (id<CBL_Replicator>)repl {
     [repl databaseClosing];
     [_activeReplicators removeObjectIdenticalTo: repl];
 }
 
 
 - (void) replicatorDidStop: (NSNotification*)n {
-    CBL_Replicator* repl = n.object;
+    id<CBL_Replicator> repl = n.object;
     if (repl.error)     // Leave it around a while so clients can see the error
         MYAfterDelay(kActiveReplicatorCleanupDelay,
                      ^{[_activeReplicators removeObjectIdenticalTo: repl];});
@@ -114,5 +118,41 @@ static NSString* checkpointInfoKey(NSString* checkpointID) {
     return [[self getLocalCheckpointDocument] objectForKey: key];
 }
 
+
+- (NSString*) lastSequenceForReplicator: (CBL_ReplicatorSettings*)settings {
+    NSString* checkpointID = [settings remoteCheckpointDocIDForLocalUUID: self.privateUUID];
+    NSString* lastSequence = [self lastSequenceWithCheckpointID: checkpointID];
+    if (!lastSequence) {
+        NSDictionary* doc = [self getLocalCheckpointDocument];
+        NSString* importedUUID = doc[kCBLDatabaseLocalCheckpoint_LocalUUID];
+        if (importedUUID) {
+            checkpointID = [settings remoteCheckpointDocIDForLocalUUID: importedUUID];
+            lastSequence = [self lastSequenceWithCheckpointID: checkpointID];
+        }
+    }
+    return lastSequence;
+}
+
+
+- (CBL_RevisionList*) unpushedRevisionsSince: (NSString*)sequence
+                                      filter: (CBLFilterBlock)filter
+                                      params: (NSDictionary*)filterParams
+                                       error: (NSError**)outError
+{
+
+    // Include conflicts so all conflicting revisions are replicated too
+    CBLChangesOptions options = kDefaultCBLChangesOptions;
+    options.includeConflicts = YES;
+
+    CBLStatus status;
+    CBL_RevisionList* revs = [self changesSinceSequence: [sequence longLongValue]
+                                                options: &options
+                                                 filter: filter
+                                                 params: filterParams
+                                                 status: &status];
+    if (!revs)
+        CBLStatusToOutNSError(status, outError);
+    return revs;
+}
 
 @end

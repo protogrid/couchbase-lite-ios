@@ -86,8 +86,56 @@
 }
 
 
+- (instancetype) initWithKeyOrPassword: (id)keyOrPassword {
+    if ([keyOrPassword isKindOfClass: [CBLSymmetricKey class]]) {
+        return keyOrPassword;
+    } else if ([keyOrPassword isKindOfClass: [NSString class]]) {
+        return [self initWithPassword: keyOrPassword];
+    } else {
+        Assert([keyOrPassword isKindOfClass: [NSData class]], @"Key must be NSString or NSData");
+        return [self initWithKeyData: keyOrPassword];
+    }
+}
+
+
+- (instancetype) initWithKeychainItemNamed: (NSString*)itemName
+                                     error: (NSError**)outError
+{
+    NSDictionary *query = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                            (__bridge id)kSecAttrService: itemName,
+                            (__bridge id)kSecReturnData: @YES,
+                            };
+    CFTypeRef cfData = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &cfData);
+    if (status == noErr) {
+        self = [self initWithKeyData: CFBridgingRelease(cfData)];
+        if (self)
+            return self;    // success!
+        status = errSecDecode; // data is not a valid AES key
+    }
+    if (outError)
+        *outError = [NSError errorWithDomain: NSOSStatusErrorDomain code: status userInfo: nil];
+    return nil;
+}
+
+
 - (NSString*) hexData {
     return CBLHexFromBytes(_keyData.bytes, _keyData.length);
+}
+
+
+- (BOOL) saveKeychainItemNamed: (NSString*)itemName error: (NSError**)outError {
+    NSDictionary *attrs = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                            (__bridge id)kSecAttrService: itemName,
+                            (__bridge id)kSecValueData: _keyData};
+    OSStatus status = SecItemAdd((__bridge CFDictionaryRef)attrs, NULL);
+    if (status != noErr) {
+        Warn(@"CBLSymmetricKey: SecItemAdd returned %d", (int)status);
+        if (outError)
+            *outError = [NSError errorWithDomain: NSOSStatusErrorDomain code: status userInfo: nil];
+        return NO;
+    }
+    return YES;
 }
 
 
@@ -175,7 +223,7 @@ static BOOL readFully(NSInputStream* in, void* dst, size_t len) {
     for (size_t bytesRead = 0; bytesRead < len; bytesRead += n) {
         n = [in read: (uint8_t*)dst + bytesRead maxLength: (len - bytesRead)];
         if (n <= 0) {
-            Warn(@"SymmetricKey: readFully failed, error=%@", in.streamError);
+            Warn(@"SymmetricKey: readFully failed, error=%@", in.streamError.my_compactDescription);
             return NO;
         }
     }
@@ -188,7 +236,7 @@ static BOOL writeFully(NSOutputStream* out, const void* src, size_t len) {
     for (size_t bytesWritten = 0; bytesWritten < len; bytesWritten += n) {
         n = [out write: (const uint8_t*)src + bytesWritten maxLength: (len - bytesWritten)];
         if (n <= 0) {
-            Warn(@"SymmetricKey: writeFully failed, error=%@", out.streamError);
+            Warn(@"SymmetricKey: writeFully failed, error=%@", out.streamError.my_compactDescription);
             return NO;
         }
     }

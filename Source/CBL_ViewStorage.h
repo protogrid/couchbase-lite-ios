@@ -8,7 +8,12 @@
 
 #import "CBL_StorageTypes.h"
 #import "CBL_Revision.h"    // defines SequenceNumber
+#import "CBLStatus.h"
 @protocol CBL_ViewStorageDelegate, CBL_QueryRowStorage;
+
+
+UsingLogDomain(View);
+UsingLogDomain(Query);
 
 
 /** Storage for a view. Instances are created by CBL_Storage implementations, and are owned by
@@ -48,17 +53,9 @@
     @return  The success/error status. */
 - (CBLStatus) updateIndexes: (NSArray*)views; // array of CBL_ViewStorage
 
-/** Queries the view without performing any reducing or grouping. */
-- (CBLQueryIteratorBlock) regularQueryWithOptions: (CBLQueryOptions*)options
-                                           status: (CBLStatus*)outStatus;
-
-/** Queries the view, with reducing or grouping as per the options. */
-- (CBLQueryIteratorBlock) reducedQueryWithOptions: (CBLQueryOptions*)options
-                                           status: (CBLStatus*)outStatus;
-
-/** Performs a full-text query as per the options. */
-- (CBLQueryIteratorBlock) fullTextQueryWithOptions: (CBLQueryOptions*)options
-                                            status: (CBLStatus*)outStatus;
+/** Queries the view. */
+- (CBLQueryEnumerator*) queryWithOptions: (CBLQueryOptions*)options
+                                  status: (CBLStatus*)outStatus;
 
 - (id<CBL_QueryRowStorage>) storageForQueryRow: (CBLQueryRow*)row;
 
@@ -75,14 +72,6 @@
 
 /** Storage for a CBLQueryRow. Instantiated by a CBL_ViewStorage when it creates a CBLQueryRow. */
 @protocol CBL_QueryRowStorage <NSObject>
-
-/** Given the raw data of a row's value, returns YES if this is a non-JSON placeholder representing
-    the entire document. If so, the CBLQueryRow will not parse this data but will instead fetch the
-    document's body from the database and use that as its value. */
-- (BOOL) rowValueIsEntireDoc: (NSData*)valueData;
-
-/** Parses a "normal" (not entire-doc) row value into a JSON-compatible object. */
-- (id) parseRowValue: (NSData*)valueData;
 
 /** Fetches a document's body; called when the row value represents the entire document.
     @param docID  The document ID

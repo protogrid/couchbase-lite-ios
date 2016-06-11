@@ -23,7 +23,7 @@ typedef enum {
 } CBLViewCollation;
 
 
-BOOL CBLRowPassesFilter(CBLDatabase* db, CBLQueryRow* row, const CBLQueryOptions* options);
+BOOL CBLQueryRowValueIsEntireDoc(id value);
 
 
 @interface CBLView () <CBL_ViewStorageDelegate>
@@ -32,14 +32,14 @@ BOOL CBLRowPassesFilter(CBLDatabase* db, CBLQueryRow* row, const CBLQueryOptions
     CBLDatabase* __weak _weakDB;
     id<CBL_ViewStorage> _storage;
     NSString* _name;
-    uint8_t _collation;
 }
 
 - (instancetype) initWithDatabase: (CBLDatabase*)db name: (NSString*)name create: (BOOL)create;
 
 - (void) close;
 
-@property (readonly) NSUInteger totalRows;
+/** Current total rows in the view. The index will not be updated when accessing this property. */
+@property (readonly) NSUInteger currentTotalRows;
 
 /** The map block alredy registered with the view. Unlike the public .mapBlock property, this
     will not look for a design document or compile a function therein. */
@@ -49,23 +49,14 @@ BOOL CBLRowPassesFilter(CBLDatabase* db, CBLQueryRow* row, const CBLQueryOptions
 
 @property (readonly) id<CBL_ViewStorage> storage;
 
-#if DEBUG  // for unit tests only
-- (void) setCollation: (CBLViewCollation)collation;
-- (void) forgetMapBlock;
-#endif
+@property (nonatomic) CBLViewCollation collation;
 
 @property (readonly) NSArray* viewsInGroup;
-
-- (CBLStatus) compileFromDesignDoc;
-
-/** Compiles a view (using the registered CBLViewCompiler) from the properties found in a CouchDB-style design document. */
-- (CBLStatus) compileFromProperties: (NSDictionary*)viewProps
-                           language: (NSString*)language;
 
 /** Updates the view's index (incrementally) if necessary.
     If the index is updated, the other views in the viewGroup will be updated as a bonus.
     @return  200 if updated, 304 if already up-to-date, else an error code */
-- (CBLStatus) updateIndex;
+- (CBLStatus) _updateIndex;
 
 /** Updates the view's index (incrementally) if necessary. No other groups will be updated.
     @return  200 if updated, 304 if already up-to-date, else an error code */
@@ -73,29 +64,35 @@ BOOL CBLRowPassesFilter(CBLDatabase* db, CBLQueryRow* row, const CBLQueryOptions
 
 - (CBLStatus) updateIndexes: (NSArray*)views;
 
+#if DEBUG  // for unit tests only
+- (void) forgetMapBlock;
+#endif
+
 @end
 
 
 @interface CBLView (Querying)
 
-/** Queries the view. Does NOT first update the index.
-    @param options  The options to use.
-    @return  An array of CBLQueryRow. */
-- (CBLQueryIteratorBlock) _queryWithOptions: (CBLQueryOptions*)options
-                                     status: (CBLStatus*)outStatus;
+/** Queries the view. Does NOT first update the index. */
+- (CBLQueryEnumerator*) _queryWithOptions: (CBLQueryOptions*)options
+                                   status: (CBLStatus*)outStatus;
 
 @end
 
 
 @interface CBLQueryEnumerator ()
-- (instancetype) initWithDatabase: (CBLDatabase*)database
-                             view: (CBLView*)view
-                   sequenceNumber: (SequenceNumber)sequenceNumber
-                         iterator: (CBLQueryIteratorBlock)iterator;
+- (instancetype) initWithSequenceNumber: (SequenceNumber)sequenceNumber
+                                   rows: (NSArray*)rows;
 - (instancetype) initWithDatabase: (CBLDatabase*)database
                              view: (CBLView*)view
                    sequenceNumber: (SequenceNumber)sequenceNumber
                              rows: (NSArray*)rows;
+- (void) setDatabase: (CBLDatabase*)database
+                view: (CBLView*)view;
+- (CBLQueryRow*) generateNextRow;
+- (void) sortUsingDescriptors: (NSArray*)sortDescriptors
+                         skip: (NSUInteger)skip
+                        limit: (NSUInteger)limit;
 @end
 
 

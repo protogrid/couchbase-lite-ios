@@ -7,6 +7,7 @@
 //
 
 #import <Foundation/Foundation.h>
+@class CBLByteBuffer;
 @protocol CBLMultipartReaderDelegate;
 
 
@@ -16,7 +17,7 @@
     @private
     __weak id<CBLMultipartReaderDelegate> _delegate;
     NSData* _boundary;
-    NSMutableData* _buffer;
+    CBLByteBuffer* _buffer;
     NSMutableDictionary* _headers;
     int _state;
     NSString* _error;

@@ -11,6 +11,9 @@
 @class CBL_Server, CBLResponse, CBL_Body, CBLMultipartWriter, CBLQueryOptions;
 
 
+UsingLogDomain(Router);
+
+
 #if DEBUG
 extern NSTimeInterval kMinHeartbeat;    // Configurable for testing purposes only
 #endif
@@ -38,6 +41,7 @@ enum {
     kCBLIncludeRevs = 4,                     // adds '_revisions' property
     kCBLIncludeRevsInfo = 8,                 // adds '_revs_info' property
     kCBLIncludeLocalSeq = 16,                // adds '_local_seq' property
+    kCBLIncludeExpiration = 32               // adds '_exp' property
 };
 
 
@@ -74,6 +78,7 @@ enum {
                         request: (NSURLRequest*)request
                         isLocal: (BOOL)isLocal;
 
+@property (copy) NSURL* source;
 @property BOOL processRanges;
 
 @property (copy) OnAccessCheckBlock onAccessCheck;

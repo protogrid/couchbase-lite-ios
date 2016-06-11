@@ -5,6 +5,9 @@
 //  Created by Christian Beer on 21.11.13.
 //  Copyright (c) 2013 Christian Beer. All rights reserved.
 //
+//  Modified by Pasin Suriyentrakorn
+//  Copyright (c) 2016 Couchbase. All rights reserved.
+//
 
 #import <CoreData/CoreData.h>
 
@@ -23,23 +26,19 @@ extern NSString* const kCBLISCustomPropertyQueryBooleanWithNumber;
 /** Error codes for CBLIncrementalStore. */
 typedef enum
 {
-    CBLIncrementalStoreErrorUndefinedError = 0,
     CBLIncrementalStoreErrorCreatingStoreFailed,
     CBLIncrementalStoreErrorMigrationOfStoreFailed,
-    CBLIncrementalStoreErrorStoringMetadataFailed,
+    CBLIncrementalStoreLoadMetadataFailed,
     CBLIncrementalStoreErrorDatabaseModelIncompatible,
-    CBLIncrementalStoreErrorCBLManagerSharedInstanceMissing,
-    CBLIncrementalStoreErrorCreatingDatabaseFailed,
-    CBLIncrementalStoreErrorPersistingInsertedObjectsFailed,
-    CBLIncrementalStoreErrorPersistingUpdatedObjectsFailed,
-    CBLIncrementalStoreErrorPersistingDeletedObjectsFailed,
     CBLIncrementalStoreErrorQueryingCouchbaseLiteFailed,
     CBLIncrementalStoreErrorUnsupportedRequestType,
     CBLIncrementalStoreErrorUnsupportedPredicate,
     CBLIncrementalStoreErrorPredicateKeyPathNotFoundInEntity,
-    CBLIncrementalStoreErrorUnsupportedFetchRequestResultType
+    CBLIncrementalStoreErrorUnsupportedFetchRequestResultType,
+    CBLIncrementalStoreErrorUnsupportedFetchRequest
 } CBLIncrementalStoreError;
 
+@class CBLIncrementalStore;
 @class CBLDocument;
 @class CBLDatabase;
 @class CBLManager;
@@ -52,6 +51,11 @@ typedef enum
  * @parameter conflictingRevisions the conflicting revisions of that document as CBLRevision instances.
  */
 typedef void(^CBLISConflictHandler)(NSArray* conflictingRevisions);
+
+@protocol CBLIncrementalStoreDelegate <NSObject>
+@optional
+- (NSDictionary *) storeWillSaveDocument:(NSDictionary *)document;
+@end
 
 
 /** NSIncrementalStore implementation that persists the data in a CouchbaseLite database. Before using this store you need to call #updateManagedObjectModel:
@@ -71,23 +75,33 @@ typedef void(^CBLISConflictHandler)(NSArray* conflictingRevisions);
 /** Conflict handling block that gets called when conflicts are to be handled. Initialied with a generic conflicts handler, can be set to NULL to not handle conflicts at all. */
 @property (nonatomic, copy) CBLISConflictHandler conflictHandler;
 
+/** Delegate allowing some more customization to the developer's implementation */
+@property (nonatomic, weak) id<CBLIncrementalStoreDelegate> delegate;
+
 /** An optional dictionary of extra properties for the incremental store.*/
 @property (nonatomic, copy) NSDictionary* customProperties;
 
-/** Returns the type of this store to use with addPersistentStore:... 
+/** Returns the type of this store to use with addPersistentStore:...
  *
  * @returns the type of this store.
  */
 + (NSString*) type;
 
+/** Configures which CBLManager instance to use. The CBLManager instance set to the store
+ * requires to have a dispatch queue set. The default value (nil) means to use the default
+ * CBLManager instance created by the CBLIncrementalStore.
+ */
++ (void) setCBLManager: (CBLManager*)manager;
++ (CBLManager*) CBLManager;
+
 /** Updates the managedObjectModel to be used with this store. Adds a property named `cblisRev` to store the current `_rev`
- * value of the CouchbaseLite representation of that entity. 
+ * value of the CouchbaseLite representation of that entity.
  *
  * @param managedObjectModel the NSManagedObjectModel that should be used with this store.
  */
 + (void) updateManagedObjectModel: (NSManagedObjectModel*)managedObjectModel;
 
-/** Convenience method that creates the whole Core Data stack using the given database model and persists the data the given database. 
+/** Convenience method that creates the whole Core Data stack using the given database model and persists the data the given database.
  * You don't need to run #updateManagedObjectModel: before.
  * To get a reference to the underlying CBLIncrementalStore you can call `context.persistentStoreCoordinator.persistentStores[0]` afterwards.
  *
@@ -117,27 +131,30 @@ typedef void(^CBLISConflictHandler)(NSArray* conflictingRevisions);
                                                      importType: (NSString*)importType
                                                           error: (NSError**)outError;
 
-/** Configures which CBLManager instance to use. The default value (nil) means to use
-    the shared CBLManager. */
-+ (void) setCBLManager: (CBLManager*)manager;
-+ (CBLManager*) CBLManager;
 
-/** Register a NSManagedObjectContext to be informed about changes in the CouchbaseLite database. A NSManagedObjectContextObjectsDidChangeNotification is sent
- * to this context on changes.
+/** Register a NSManagedObjectContext to be informed about changes in the CouchbaseLite database.
+ * A NSManagedObjectContextObjectsDidChangeNotification is sent to this context on changes.
  */
 - (void) addObservingManagedObjectContext: (NSManagedObjectContext*)context;
-/** Deregister a NSManagedObjectContext from observing changes.
- */
+
+/** Deregister a NSManagedObjectContext from observing changes.*/
 - (void) removeObservingManagedObjectContext: (NSManagedObjectContext*)context;
 
-/** Creates a view for fetching entities by a property name. Can speed up fetching this entity by this property. If, for example, your entity 
- * "Entity" references an entity "Subentity" by a property named "subentities", you can speed up fetching those entities by calling 
- * `-[store defineFetchViewForEntity:@"Subentity" byProperty:@"entities"];`.
- * 
- * @param entityName name of the entity that should be fetched
- * @param propertyName name of the property referencing this entity
+
+/** Purges this object from the database. This operation will be executed on the same dispatch queue
+ * as the database.
+ *
+ * In multiple context setup, if the object was created on a context aside from the root context, and
+ * the object hasn't been retrieved back from the store, the object ID of the object may be still a
+ * tempory ID as in general the ID will not be refreshed with the permanent ID from its root
+ * context. As a result, the object may not be purged as expected due to ID mismatching. To avoid
+ * the issue, call NSManagedObjectContext's -obtainPermanentIDsForObjects:error: to obtain
+ * its permanent ID.
+ *
+ * @param object the NSManagedObject object to be purged
+ * @param outError an optional error reference. Contains an NSError when the return is NO.
+ * @returns YES of success, otherwise return NO.
  */
-- (void) defineFetchViewForEntity: (NSString*)entityName byProperty: (NSString*)propertyName
-    __attribute__((deprecated("The method is no longer needed, and calling this method will do nothing.")));
+- (BOOL) purgeObject: (NSManagedObject*)object error: (NSError**)outError;
 
 @end

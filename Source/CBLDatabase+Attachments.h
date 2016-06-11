@@ -8,7 +8,7 @@
 
 #import "CBLDatabase+Internal.h"
 #import "CBL_BlobStore.h"
-@class CBL_Revision, CBLMultipartWriter, CBL_Attachment;
+@class CBL_Revision, CBL_Attachment, CBL_BlobStoreWriter;
 
 
 /** Types of encoding/compression of stored attachments. */
@@ -24,13 +24,17 @@ typedef enum {
 
 + (NSString*) blobKeyToDigest: (CBLBlobKey)key;
 
-/** Creates a CBL_BlobStoreWriter object that can be used to stream an attachment to the store. */
-- (CBL_BlobStoreWriter*) attachmentWriter;
+/** Register attachment bodies in `attachments` (NSData or file NSURLs) corresponding to the
+    attachments in `rev`. The _attachments dict will be mutated if necessary to add "digest"
+    and "follows" properties. */
+- (BOOL) registerAttachmentBodies: (NSDictionary*)attachments
+                      forRevision: (CBL_MutableRevision*)rev
+                            error: (NSError**)outError;
 
 /** Scans the rev's _attachments dictionary, adding inline attachment data to the blob-store
     and turning all the attachments into stubs. */
 - (BOOL) processAttachmentsForRevision: (CBL_MutableRevision*)rev
-                             prevRevID: (NSString*)prevRevID
+                              ancestry: (NSArray<CBL_RevID*>*)ancestry // 1st item is parent revID, etc.
                                 status: (CBLStatus*)outStatus;
 
 /** Modifies a CBL_Revision's _attachments dictionary by adding the "data" property to all
@@ -48,14 +52,9 @@ typedef enum {
                       decode: (BOOL)decodeAttachments
                       status: (CBLStatus*)outStatus;
 
-/** Generates a MIME multipart writer for a revision, with separate body parts for each attachment whose "follows" property is set. */
-- (CBLMultipartWriter*) multipartWriterForRevision: (CBL_Revision*)rev
-                                      contentType: (NSString*)contentType;
-
-/** Returns a CBL_Attachment for an attachment in a stored revision. */
-- (CBL_Attachment*) attachmentForRevision: (CBL_Revision*)rev
-                                    named: (NSString*)filename
-                                   status: (CBLStatus*)outStatus;
+- (NSDictionary*) attachmentsForDocID: (NSString*)docID
+                                revID: (CBL_RevID*)revID
+                               status: (CBLStatus*)outStatus;
 
 /** Uses the "digest" field of the attachment dict to look up the attachment in the store.
     Input dict must come from an already-saved revision. */
@@ -68,14 +67,11 @@ typedef enum {
 /** Deletes obsolete attachments from the database and blob store. */
 - (BOOL) garbageCollectAttachments: (NSError**)outError;
 
-/** Updates or deletes an attachment, creating a new document revision in the process.
-    Used by the PUT / DELETE methods called on attachment URLs. */
-- (CBL_Revision*) updateAttachment: (NSString*)filename
-                            body: (CBL_BlobStoreWriter*)body
-                            type: (NSString*)contentType
-                        encoding: (CBLAttachmentEncoding)encoding
-                         ofDocID: (NSString*)docID
-                           revID: (NSString*)oldRevID
-                          status: (CBLStatus*)outStatus;
+- (void) rememberAttachmentWriter: (CBL_BlobStoreWriter*)writer;
+- (void) rememberAttachmentWriter: (CBL_BlobStoreWriter*)writer forDigest:(NSString*)digest;
+- (void) rememberAttachmentWritersForDigests: (NSDictionary*)writersByDigests;
+#if DEBUG
+- (id) attachmentWriterForAttachment: (NSDictionary*)attachment;
+#endif
 
 @end

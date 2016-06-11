@@ -156,7 +156,7 @@ static void test(QueryBuilder_Tests *self,
          /*order by*/ @"date",
          @"type == \"post\"",
          @"{tags, date}",
-         @"{title, body, author}",
+         @"{title, body, author, date}",
          @"{$TAG}",
          @"{$TAG}",
          nil,
@@ -168,7 +168,7 @@ static void test(QueryBuilder_Tests *self,
          /*order by*/ @"date",
          @"type == \"comment\"",
          @"{post_id, date}",
-         @"{body, author}",
+         @"{body, author, date}",
          @"{$POST_ID}",
          @"{$POST_ID}",
          nil,
@@ -180,7 +180,7 @@ static void test(QueryBuilder_Tests *self,
          /*order by*/ @"name",
          @"type == \"bird\"",
          @"name",
-         @"wingspan",
+         @"{wingspan, name}",
          nil, // there's no startKey or endKey because we didn't specify a range.
          nil,
          nil,
@@ -221,6 +221,19 @@ static void test(QueryBuilder_Tests *self,
          nil,
          nil,
          nil,
+         nil);
+
+    // For https://github.com/couchbase/couchbase-lite-ios/issues/857
+    test(self, /*select*/ nil,
+         /*where*/ @"model_type == 'member' AND uid IN $uids",
+         /*order by*/ @"name",
+         @"model_type == \"member\"",
+         @"uid",
+         @"name",
+         nil,
+         nil,
+         @"$uids",
+         @"[(value0, ascending, compare:)]",
          nil);
 }
 
@@ -281,15 +294,16 @@ static void test(QueryBuilder_Tests *self,
     NSString* exp = b.explanation;
     Log(@"Explanation = \n%@", exp);
     AssertEqual(exp, // See comment above regarding view name
-@"// view \"builder-pEDpTLj0yE5IbGN7XXS9fcH24L4=\":\n\
+@"// view \"builder-x2w/vgtJDacv2N7Jb90pZwTkIcU=\":\n\
 view.map = {\n\
     if (type == \"post\")\n\
         for (i in tags)\n\
-            emit(i, [title, body, author, date]);\n\
+            emit([i, date], [title, body, author, date]);\n\
 };\n\
-query.startKey = $TAG;\n\
-query.endKey = $TAG;\n\
-query.sortDescriptors = [(value3, descending, compare:)];\n");
+query.startKey = [$TAG];\n\
+query.endKey = [$TAG];\n\
+query.prefixMatchLevel = 1;\n\
+query.descending = YES;\n");
 }
 
 
@@ -370,7 +384,10 @@ query.sortDescriptors = [(value3, descending, compare:)];\n");
     Assert(b, @"Failed to build: %@", error);
     Log(@"%@", b.explanation);
 
-    e = [b runQueryWithContext: nil error: &error];
+    CBLQuery* query = [b createQueryWithContext: nil];
+    Assert(query.descending);
+    AssertNil(query.sortDescriptors);
+    e = [query run: &error];
     Assert(e, @"Query failed: %@", error);
     seq = 100;
     for (CBLQueryRow* row in e) {
@@ -415,5 +432,308 @@ query.sortDescriptors = [(value3, descending, compare:)];\n");
     }
 }
 
+// For https://github.com/couchbase/couchbase-lite-ios/issues/857
+- (void) test09_SortWithContains {
+    [db inTransaction:^BOOL{
+        for (unsigned i=0; i<100; i++) {
+            @autoreleasepool {
+                NSDictionary* properties = @{@"name": [NSString stringWithFormat:@"%d", i*773%100], @"uid": @(i), @"model_type":@"member"};
+                [self createDocumentWithProperties: properties];
+            }
+        }
+        return YES;
+    }];
+
+    NSMutableArray *predicates = [[NSMutableArray alloc] init];
+    NSString *where = [NSString stringWithFormat:@"%@=='%@'", @"model_type", @"member"];
+    NSPredicate *typePredicate = [NSPredicate predicateWithFormat:where];
+    [predicates addObject:typePredicate];
+    NSPredicate *idsPredicate = [NSPredicate predicateWithFormat:@"uid in $uids"];
+    [predicates addObject:idsPredicate];
+    NSPredicate *predicate = [NSCompoundPredicate andPredicateWithSubpredicates:predicates];
+    NSError *error = nil;
+    NSSortDescriptor *sort = [NSSortDescriptor sortDescriptorWithKey:@"name" ascending:YES];
+
+    for (int sorted = 0; sorted <= 1; ++sorted) {
+        Log(@"--- sorted = %d", sorted);
+        CBLQueryBuilder* b = [[CBLQueryBuilder alloc] initWithDatabase: db
+                                                                select: nil
+                                                        wherePredicate: predicate
+                                                               orderBy: (sorted ? @[sort] : nil)
+                                                                 error: &error];
+        Assert(b, @"Failed to build: %@", error);
+        Log(@"%@", b.explanation);
+
+        NSArray *uids = @[@(7), @(13), @(67), @(88), @(56)];
+        NSDictionary *context = @{@"uids":uids};
+        CBLQueryEnumerator *e = [b runQueryWithContext:context error:&error];
+        Assert(e, @"Query failed: %@", error);
+        NSArray* rows = e.allObjects;
+        NSArray* names = [rows my_map:^id(CBLQueryRow* row) {return row.document[@"name"];}];
+        if (sorted)
+            AssertEqual(names, (@[@"11", @"24", @"49", @"88", @"91"]));
+        AssertEq(rows.count, uids.count);
+    }
+}
+
+// https://github.com/couchbase/couchbase-lite-ios/issues/890
+- (void) test10_PredicateHasMoreThanTwoVariable {
+    [db inTransaction:^BOOL{
+        for (unsigned i=0; i<100; i++) {
+            @autoreleasepool {
+                unsigned random = (i+17)*773%100;
+                NSDictionary* properties = @{@"id": @(i),
+                                             @"model_type":@"message",
+                                             @"text": [NSString stringWithFormat:@"%d", random],
+                                             @"create_time":@(random),
+                                             @"channel_id":@((i+30)*17%13)};
+                [self createDocumentWithProperties: properties];
+            }
+        }
+        return YES;
+    }];
+
+    //Get the latest message
+    NSPredicate *typePredicate = [NSPredicate predicateWithFormat:@"model_type == 'message'"];
+    NSPredicate *timePredicate = [NSPredicate predicateWithFormat:@"create_time > $create_time"];
+    NSPredicate *channelPredicate = [NSPredicate predicateWithFormat:@"channel_id == $channel_id"];
+    NSCompoundPredicate *predicate = [NSCompoundPredicate andPredicateWithSubpredicates:@[typePredicate, timePredicate, channelPredicate]];
+    NSError *error = nil;
+
+    CBLQueryBuilder* b = [[CBLQueryBuilder alloc] initWithDatabase: db
+                                                            select: nil
+                                                    wherePredicate: predicate
+                                                           orderBy: nil
+                                                             error: &error];
+    Assert(b, @"Failed to build: %@", error);
+    Log(@"%@", b.explanation);
+    CBLQuery* query = [b createQueryWithContext: @{@"create_time":@(50), @"channel_id":@(7)}];
+    CBLQueryEnumerator *e = [query run:&error];
+    Assert(e, @"Query failed: %@", error);
+
+    NSArray* rows = e.allObjects;
+    Log(@"Rows = %@", rows);
+    NSArray* names = [rows my_map:^id(CBLQueryRow* row) {return row.document[@"id"];}];
+    AssertEqual(names, (@[@92, @66, @40, @14]));
+}
+
+// https://github.com/couchbase/couchbase-lite-ios/issues/889
+- (void) test11_Descending {
+    // Mixed ascending/descending order can't be used as a key:
+    NSError* error;
+    CBLQueryBuilder* b;
+    b = [[CBLQueryBuilder alloc] initWithDatabase: db
+                                           select: nil
+                                            where: @"testName=='testDatabase'"
+                                          orderBy: @[@"foo", @"-bar"]
+                                            error: &error];
+
+    Assert(b, @"Failed to build: %@", error);
+    AssertEqual(b.keyExpression, [NSExpression expressionForConstantValue: @""]);
+    AssertNil(b.queryStartKey);
+    AssertNil(b.queryEndKey);
+    AssertEq(b.sortDescriptors.count, 2u);
+
+    b = [[CBLQueryBuilder alloc] initWithDatabase: db
+                                           select: nil
+                                            where: @"testName=='testDatabase'"
+                                          orderBy: @[@"-bar", @"foo"] // reversed
+                                            error: &error];
+    AssertEqual(b.keyExpression, [NSExpression expressionForConstantValue: @""]);
+    AssertNil(b.queryStartKey);
+    AssertNil(b.queryEndKey);
+    AssertEq(b.sortDescriptors.count, 2u);
+
+    // But two descending sorts can be:
+    b = [[CBLQueryBuilder alloc] initWithDatabase: db
+                                           select: nil
+                                            where: @"testName=='testDatabase'"
+                                          orderBy: @[@"-foo", @"-bar"] // both descending
+                                            error: &error];
+    AssertEqual(b.keyExpression.description, @"{foo, bar}");
+    AssertNil(b.queryStartKey);
+    AssertNil(b.queryEndKey);
+    AssertNil(b.sortDescriptors);
+    Assert(b.queryDescending);
+
+    // or two ascending:
+    b = [[CBLQueryBuilder alloc] initWithDatabase: db
+                                           select: nil
+                                            where: @"testName=='testDatabase'"
+                                          orderBy: @[@"foo", @"bar"] // both ascending
+                                            error: &error];
+    AssertEqual(b.keyExpression.description, @"{foo, bar}");
+    AssertNil(b.queryStartKey);
+    AssertNil(b.queryEndKey);
+    AssertNil(b.sortDescriptors);
+    Assert(!b.queryDescending);
+}
+
+// https://github.com/couchbase/couchbase-lite-ios/issues/889
+- (void) test12_DescendingKeyRange {
+    NSError* error;
+    CBLQueryBuilder* b;
+    b = [[CBLQueryBuilder alloc] initWithDatabase: db
+                                           select: nil
+                                            where: @"testName=='testDatabase' and foo > $MINFOO"
+                                          orderBy: @[@"-foo", @"-bar"] // both descending
+                                            error: &error];
+    Log(@"%@", b.explanation);
+    AssertEqual(b.keyExpression.description, @"{foo, bar}");
+    AssertEqual(b.queryStartKey.description, @"{}");
+    AssertEqual(b.queryEndKey.description, @"{$MINFOO}");
+    AssertNil(b.sortDescriptors);
+    Assert(b.queryDescending);
+}
+
+// https://github.com/couchbase/couchbase-lite-ios/issues/889
+- (void) test13_DescendingKeyRangeWithEquality {
+    NSError* error;
+    CBLQueryBuilder* b;
+    b = [[CBLQueryBuilder alloc] initWithDatabase: db
+                                           select: nil
+                                            where: @"testName=='testDatabase' and zog = $ZOG and foo > $MINFOO"
+                                          orderBy: @[@"-foo", @"-bar"] // both descending
+                                            error: &error];
+    Log(@"%@", b.explanation);
+    AssertEqual(b.keyExpression.description, @"{zog, foo, bar}");
+    AssertEqual(b.queryStartKey.description, @"{$ZOG, {}}");
+    AssertEqual(b.queryEndKey.description, @"{$ZOG, $MINFOO}");
+    AssertNil(b.sortDescriptors);
+    Assert(b.queryDescending);
+}
+
+// https://github.com/couchbase/couchbase-lite-ios/issues/889
+- (void) test14_SortedQueryWithLimit {
+    [db inTransaction:^BOOL{
+        for (unsigned i=0; i<100; i++) {
+            @autoreleasepool {
+                unsigned random = (i+17)*773%100;
+                NSDictionary* properties = @{@"id": @(i),
+                                             @"model_type":@"message",
+                                             @"text": [NSString stringWithFormat:@"%d", random],
+                                             @"create_time":@(random)};
+                [self createDocumentWithProperties: properties];
+            }
+        }
+        return YES;
+    }];
+
+    //Get the latest message
+    NSPredicate *predicate = [NSPredicate predicateWithFormat:@"model_type == 'message'"];
+    NSError *error = nil;
+    NSSortDescriptor *sort = [NSSortDescriptor sortDescriptorWithKey:@"create_time" ascending:NO comparator:^NSComparisonResult(id obj1, id obj2) {
+        return [obj1 compare:obj2];
+    }];
+    /*
+     NSSortDescriptor *sort = [NSSortDescriptor sortDescriptorWithKey:@"text" ascending:NO comparator:^NSComparisonResult(id obj1, id obj2) {
+     return [obj1 compare:obj2 options:NSNumericSearch];
+     }];
+     */
+    NSNumber *resultID = nil;
+    NSNumber *limitedResultID = nil;
+    for (int limited = 0; limited <= 1; ++limited) {
+
+        CBLQueryBuilder* b = [[CBLQueryBuilder alloc] initWithDatabase: db
+                                                                select: nil
+                                                        wherePredicate: predicate
+                                                               orderBy: @[sort]
+                                                                 error: &error];
+        Assert(b, @"Failed to build: %@", error);
+        Log(@"%@", b.explanation);
+
+        CBLQuery* query = [b createQueryWithContext: nil];
+        query.prefetch = YES;
+        if (limited) {
+            query.limit = 1;
+        }
+        CBLQueryEnumerator *e = [query run:&error];
+        Assert(e, @"Query failed: %@", error);
+        NSArray* rows = e.allObjects;
+        NSLog(@"\n%@", [[[rows my_map:^id(CBLQueryRow* row) {
+            return [ NSString stringWithFormat:@"id:%@, text:%@, create_time:%@",
+                    row.document[@"id"],
+                    row.document[@"text"],
+                    row.document[@"create_time"]];
+        }] valueForKey:@"description"] componentsJoinedByString:@"\n"]);
+        NSArray* ids = [rows my_map:^id(CBLQueryRow* row) {return row.document[@"id"];}];
+        Assert(ids.count > 0);
+        if (limited) {
+            limitedResultID = ids[0];
+        } else {
+            resultID = ids[0];
+        }
+    }
+    AssertEqual(resultID, limitedResultID);
+}
+
+// https://github.com/couchbase/couchbase-lite-ios/issues/908
+- (void) test15_SortedQueryWithPrefixMatchAndLimit {
+    [db inTransaction:^BOOL{
+        for (unsigned i=0; i<100; i++) {
+            @autoreleasepool {
+                unsigned random = (i+17)*773%100;
+                unsigned cid = i % 7;
+                NSDictionary* properties = @{@"id": @(i),
+                                             @"model_type":@"message",
+                                             @"text": [NSString stringWithFormat:@"%d", random],
+                                             @"create_time":@(random),
+                                             @"cid":@(cid),
+                                             };
+                [self createDocumentWithProperties: properties];
+            }
+        }
+        return YES;
+    }];
+
+    //Get the latest message
+    NSPredicate *predicate = [NSPredicate predicateWithFormat:@"model_type == 'message' && cid==$cid"];
+    NSError *error = nil;
+    NSSortDescriptor *sort = [NSSortDescriptor sortDescriptorWithKey:@"create_time" ascending:NO];
+    //    NSSortDescriptor *sort = [NSSortDescriptor sortDescriptorWithKey:@"create_time" ascending:NO comparator:^NSComparisonResult(id obj1, id obj2) {
+    //        return [obj1 compare:obj2];
+    //    }];
+    /*
+     NSSortDescriptor *sort = [NSSortDescriptor sortDescriptorWithKey:@"text" ascending:NO comparator:^NSComparisonResult(id obj1, id obj2) {
+     return [obj1 compare:obj2 options:NSNumericSearch];
+     }];
+     */
+    NSNumber *resultID = nil;
+    NSNumber *limitedResultID = nil;
+    for (int limited = 0; limited <= 1; ++limited) {
+
+        CBLQueryBuilder* b = [[CBLQueryBuilder alloc] initWithDatabase: db
+                                                                select: nil
+                                                        wherePredicate: predicate
+                                                               orderBy: @[sort]
+                                                                 error: &error];
+        Assert(b, @"Failed to build: %@", error);
+        Log(@"%@", b.explanation);
+
+        CBLQuery* query = [b createQueryWithContext: @{@"cid":@(5)}];
+        query.prefetch = YES;
+        if (limited) {
+            query.limit = 1;
+        }
+        CBLQueryEnumerator *e = [query run:&error];
+        Assert(e, @"Query failed: %@", error);
+        NSArray* rows = e.allObjects;
+        NSLog(@"\n%@", [[[rows my_map:^id(CBLQueryRow* row) {
+            return [ NSString stringWithFormat:@"id:%@, text:%@, create_time:%@",
+                    row.document[@"id"],
+                    row.document[@"text"],
+                    row.document[@"create_time"]];
+        }] valueForKey:@"description"] componentsJoinedByString:@"\n"]);
+        NSArray* ids = [rows my_map:^id(CBLQueryRow* row) {return row.document[@"id"];}];
+        Assert(ids.count > 0);
+        if (limited) {
+            limitedResultID = ids[0];
+        } else {
+            resultID = ids[0];
+        }
+    }
+    Log(@"%@", resultID);
+    AssertEqual(resultID, limitedResultID);
+}
 
 @end

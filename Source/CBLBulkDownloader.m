@@ -17,7 +17,7 @@
 #import "CBLBulkDownloader.h"
 #import "CBLMultipartReader.h"
 #import "CBLMultipartDocumentReader.h"
-#import "CBL_Puller.h"
+#import "CBLRestPuller.h"
 #import "CBL_Revision.h"
 #import "CBLDatabase+Internal.h"
 #import "CBLMisc.h"
@@ -32,6 +32,7 @@
 @implementation CBLBulkDownloader
 {
     CBLDatabase* _db;
+    BOOL _attachments;
     CBLMultipartReader* _topReader;
     CBLMultipartDocumentReader* _docReader;
     unsigned _docCount;
@@ -41,47 +42,54 @@
 
 - (instancetype) initWithDbURL: (NSURL*)dbURL
                       database: (CBLDatabase*)database
-                requestHeaders: (NSDictionary *) requestHeaders
                      revisions: (NSArray*)revs
+                   attachments: (BOOL)attachments
                     onDocument: (CBLBulkDownloaderDocumentBlock)onDocument
                   onCompletion: (CBLRemoteRequestCompletionBlock)onCompletion
 {
     // Build up a JSON body describing what revisions we want:
+    NSUInteger maxRevTreeDepth = database.maxRevTreeDepth;
     NSArray* keys = [revs my_map: ^(CBL_Revision* rev) {
-        NSArray* attsSince = [database.storage getPossibleAncestorRevisionIDs: rev
-                                                           limit: kMaxNumberOfAttsSince
-                                                 onlyAttachments: YES];
-        if (attsSince.count == 0)
-            attsSince = nil;
-        return $dict({@"id", rev.docID},
-                     {@"rev", rev.revID},
-                     {@"atts_since", attsSince});
+        BOOL haveBodies = NO;
+        NSArray<CBL_RevID*>* possibleAncestors;
+        possibleAncestors = [database.storage getPossibleAncestorRevisionIDs: rev
+                                                       limit: kMaxNumberOfAttsSince
+                                                  haveBodies: (attachments ? &haveBodies : NULL)];
+        NSMutableDictionary* key = $mdict({@"id",  rev.docID},
+                                          {@"rev", rev.revIDString});
+        if (possibleAncestors) {
+            [key setObject: [possibleAncestors my_map: ^id(CBL_RevID* r) {return r.asString;}]
+                    forKey: (haveBodies ? @"atts_since" : @"revs_from")];
+        } else {
+            if (rev.generation > maxRevTreeDepth)
+                key[@"revs_limit"] = @(maxRevTreeDepth);
+        }
+        return key;
     }];
-    NSDictionary* body = @{@"docs": keys};
+
+    NSString* query = attachments ?@"_bulk_get?revs=true&attachments=true" :@"_bulk_get?revs=true";
+
+    LogVerbose(Sync, @"%@: POST %@  %@",
+               self, query, [CBLJSON stringWithJSONObject: keys options: 0 error: NULL]);
 
     self = [super initWithMethod: @"POST"
-                             URL: CBLAppendToURL(dbURL, @"_bulk_get?revs=true&attachments=true")
-                            body: body
-                  requestHeaders: requestHeaders
+                             URL: CBLAppendToURL(dbURL, query)
+                            body: @{@"docs": keys}
                     onCompletion: onCompletion];
     if (self) {
         _db = database;
+        _attachments = attachments;
         _onDocument = onDocument;
-    }
+
+        [_request setValue: @"multipart/related" forHTTPHeaderField: @"Accept"];
+        [_request setValue: @"gzip" forHTTPHeaderField: @"X-Accept-Part-Encoding"];
+}
     return self;
 }
 
 
 - (NSString*) description {
     return $sprintf(@"%@[%@]", [self class], _request.URL.path);
-}
-
-
-- (void) setupRequest: (NSMutableURLRequest*)request withBody: (id)body {
-    request.HTTPBody = [CBLJSON dataWithJSONObject: body options: 0 error: NULL];
-    [request addValue: @"application/json" forHTTPHeaderField: @"Content-Type"];
-    [request setValue: @"multipart/related" forHTTPHeaderField: @"Accept"];
-    [request setValue: @"gzip" forHTTPHeaderField: @"X-Accept-Part-Encoding"];
 }
 
 
@@ -98,39 +106,37 @@
 }
 
 
-- (void)connection:(NSURLConnection *)connection didReceiveResponse:(NSURLResponse *)response {
-    CBLStatus status = (CBLStatus) ((NSHTTPURLResponse*)response).statusCode;
-    if (status < 300) {
+- (void) didReceiveResponse:(NSHTTPURLResponse *)response {
+    [super didReceiveResponse: response];
+    if (_status < 300) {
         // Check the content type to see whether it's a multipart response:
-        NSDictionary* headers = [(NSHTTPURLResponse*)response allHeaderFields];
-        NSString* contentType = headers[@"Content-Type"];
+        NSString* contentType = _responseHeaders[@"Content-Type"];
         _topReader = [[CBLMultipartReader alloc] initWithContentType: contentType
                                                             delegate: self];
         if (!_topReader) {
             Warn(@"%@ got invalid Content-Type '%@'", self, contentType);
-            [self cancelWithStatus: kCBLStatusUpstreamError];
+            [self cancelWithStatus: kCBLStatusUpstreamError message: @"Invalid Content-Type"];
             return;
         }
     }
-    
-    [super connection: connection didReceiveResponse: response];
 }
 
 
-- (void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)data {
-    [super connection: connection didReceiveData: data];
+- (void) didReceiveData:(NSData *)data {
+    [super didReceiveData: data];
     [_topReader appendData: data];
     if (_topReader.error) {
-        [self cancelWithStatus: kCBLStatusUpstreamError];
+        [self cancelWithStatus: kCBLStatusUpstreamError message: _topReader.error];
     }
 }
 
 
-- (void)connectionDidFinishLoading:(NSURLConnection *)connection {
-    LogTo(SyncVerbose, @"%@: Finished loading (%u documents)", self, _docCount);
+- (void)connectionDidFinishLoading {
+    LogVerbose(Sync, @"%@: Finished loading (%u documents)", self, _docCount);
     if (!_topReader.finished) {
         Warn(@"%@ got unexpected EOF", self);
-        [self cancelWithStatus: kCBLStatusUpstreamError];
+        [self cancelWithStatus: kCBLStatusUpstreamError
+                       message: @"Error reading multipart response"];
         return;
     }
     
@@ -145,7 +151,7 @@
 /** This method is called when a part's headers have been parsed, before its data is parsed. */
 - (BOOL) startedPart: (NSDictionary*)headers {
     Assert(!_docReader);
-    LogTo(SyncVerbose, @"%@: Starting new document; ID=\"%@\"", self, headers[@"X-Doc-ID"]);
+    LogVerbose(Sync, @"%@: Starting new document; ID=\"%@\"", self, headers[@"X-Doc-ID"]);
     _docReader = [[CBLMultipartDocumentReader alloc] initWithDatabase: _db];
     _docReader.headers = headers;
     return YES;
@@ -155,7 +161,7 @@
 - (BOOL) appendToPart: (NSData*)data {
     Assert(_docReader);
     if (![_docReader appendData: data]) {
-        [self cancelWithStatus: _docReader.status];
+        [self cancelWithStatus: _docReader.status message: nil];
         return NO;
     }
     return YES;
@@ -163,15 +169,16 @@
 
 /** This method is called when a part is complete. */
 - (BOOL) finishedPart {
-    LogTo(SyncVerbose, @"%@: Finished document", self);
+    LogVerbose(Sync, @"%@: Finished document", self);
     Assert(_docReader);
     if (![_docReader finish]) {
-        [self cancelWithStatus: _docReader.status];
+        [self cancelWithStatus: _docReader.status message: nil];
         _docReader = nil;
         return NO;
     }
     ++_docCount;
-    _onDocument(_docReader.document);
+    __typeof(_onDocument) onDocument = _onDocument;
+    onDocument(_docReader.document);
     _docReader = nil;
     return YES;
 }

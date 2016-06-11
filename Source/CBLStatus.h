@@ -22,6 +22,7 @@ typedef enum {
     kCBLStatusMethodNotAllowed = 405,
     kCBLStatusNotAcceptable  = 406,
     kCBLStatusConflict       = 409,
+    kCBLStatusGone           = 410,
     kCBLStatusDuplicate      = 412,      // Formally known as "Precondition Failed"
     kCBLStatusUnsupportedType= 415,
     
@@ -36,6 +37,7 @@ typedef enum {
     kCBLStatusBadID          = 494,
     kCBLStatusBadParam       = 495,
     kCBLStatusDeleted        = 496,      // Document deleted
+    kCBLStatusInvalidStorageType = 497,
 
     kCBLStatusBadChangesFeed = 587,
     kCBLStatusChangesFeedTruncated = 588,
@@ -46,6 +48,7 @@ typedef enum {
     kCBLStatusCallbackError  = 593,      // app callback (emit fn, etc.) failed
     kCBLStatusException      = 594,      // Exception raised/caught
     kCBLStatusDBBusy         = 595,      // SQLite DB is busy (this is recoverable!)
+    kCBLStatusCanceled       = 596,      // Operation was canceled by client
 } CBLStatus;
 
 
@@ -53,8 +56,12 @@ static inline bool CBLStatusIsError(CBLStatus status) {return status >= 400;}
 
 int CBLStatusToHTTPStatus( CBLStatus status, NSString** outMessage );
 
-NSError* CBLStatusToNSError( CBLStatus status, NSURL* url );
-NSError* CBLStatusToNSErrorWithInfo( CBLStatus status, NSURL* url, NSDictionary* extraInfo );
-CBLStatus CBLStatusFromNSError(NSError* error, CBLStatus defaultStatus);
+NSError* CBLStatusToNSError( CBLStatus status );
+NSError* CBLStatusToNSErrorWithInfo( CBLStatus status, NSString *reason, NSURL* url,
+                                     NSDictionary* extraInfo );
 
-BOOL ReturnNSErrorFromCBLStatus( CBLStatus status, NSError** outError);
+/** If outError is not NULL, sets *outError to an NSError equivalent of status.
+    @return  YES if status is successful, NO if it's an error. */
+BOOL CBLStatusToOutNSError(CBLStatus status, NSError** outError);
+
+CBLStatus CBLStatusFromNSError(NSError* error, CBLStatus defaultStatus);

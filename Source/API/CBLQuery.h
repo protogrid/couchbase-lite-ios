@@ -9,7 +9,7 @@
 #import "CBLBase.h"
 
 @class CBLDatabase, CBLDocument;
-@class CBLLiveQuery, CBLQueryEnumerator, CBLQueryRow, CBLRevision;
+@class CBLLiveQuery, CBLQueryEnumerator, CBLQueryRow, CBLSavedRevision;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -148,7 +148,7 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
 @interface CBLLiveQuery : CBLQuery
 
 /** The shortest interval at which the query will update, regardless of how often the
-    database changes. Defaults to 0.5 sec. Increase this if the query is expensive and
+    database changes. Defaults to 0.2 sec. Increase this if the query is expensive and
     the database updates frequently, to limit CPU consumption. */
 @property (nonatomic) NSTimeInterval updateInterval;
 
@@ -181,7 +181,7 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
 
 /** Enumerator on a CBLQuery's result rows.
     The objects returned are instances of CBLQueryRow. */
-@interface CBLQueryEnumerator : NSEnumerator <NSCopying, NSFastEnumeration>
+@interface CBLQueryEnumerator : NSEnumerator <NSCopying>
 
 /** The number of rows returned in this enumerator */
 @property (readonly) NSUInteger count;
@@ -192,14 +192,13 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
 /** YES if the database has changed since the view was generated. */
 @property (readonly) BOOL stale;
 
+- (nullable CBLQueryRow*) nextObject;
+
 /** The next result row. This is the same as -nextObject but with a checked return type. */
 - (nullable CBLQueryRow*) nextRow;
 
 /** Random access to a row in the result */
 - (CBLQueryRow*) rowAtIndex: (NSUInteger)index;
-
-/** Resets the enumeration so the next call to -nextObject or -nextRow will return the first row. */
-- (void) reset;
 
 /** Re-sorts the rows based on the given sort descriptors.
     This operation requires that all rows be loaded into memory, so you can't have previously
@@ -217,6 +216,7 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
 - (void) sortUsingDescriptors: (NSArray*)sortDescriptors;
 
 - (instancetype) init NS_UNAVAILABLE;
+- (void) reset  __attribute__((deprecated("call allObjects and iterate that array multiple times")));
 
 @end
 
@@ -279,12 +279,12 @@ typedef NS_ENUM(unsigned, CBLIndexUpdateMode) {
 /** The database sequence number of the associated doc/revision. */
 @property (readonly) UInt64 sequenceNumber;
 
-/** Returns all conflicting revisions of the document, as an array of CBLRevision, or nil if the
-    document is not in conflict.
+/** Returns all conflicting revisions of the document, as an array of CBLSavedRevision,
+    or nil if the document is not in conflict.
     The first object in the array will be the default "winning" revision that shadows the others.
     This is only valid in an allDocuments query whose allDocsMode is set to kCBLShowConflicts
     or kCBLOnlyConflicts; otherwise it returns nil. */
-@property (readonly, nullable) CBLArrayOf(CBLRevision*)* conflictingRevisions;
+@property (readonly, nullable) CBLArrayOf(CBLSavedRevision*)* conflictingRevisions;
 
 - (instancetype) init NS_UNAVAILABLE;
 

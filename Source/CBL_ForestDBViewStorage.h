@@ -7,15 +7,20 @@
 //
 
 #import "CBL_ViewStorage.h"
-@class CBL_ForestDBStorage;
+@class CBL_ForestDBStorage, MYAction;
 
 
-@interface CBL_ForestDBViewStorage : NSObject <CBL_ViewStorage>
+@interface CBL_ForestDBViewStorage : NSObject <CBL_ViewStorage, CBL_QueryRowStorage>
 
 // internal:
 - (instancetype) initWithDBStorage: (CBL_ForestDBStorage*)dbStorage
                               name: (NSString*)name
                             create: (BOOL)create;
+@property (readonly, nonatomic) CBL_ForestDBStorage* dbStorage;
 + (NSString*) fileNameToViewName: (NSString*)fileName;
+
+- (MYAction*) actionToChangeEncryptionKey;
+
+- (void) closeIndex;
 
 @end

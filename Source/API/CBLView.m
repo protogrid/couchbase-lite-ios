@@ -16,12 +16,16 @@
 #import "CouchbaseLitePrivate.h"
 #import "CBL_ViewStorage.h"
 #import "CBLView+Internal.h"
+#import "CBLView+REST.h"
 #import "CBLSpecialKey.h"
 #import "CBL_Shared.h"
 #import "CBLInternal.h"
 #import "CBJSONEncoder.h"
 #import "CBLMisc.h"
 #import "ExceptionUtils.h"
+
+
+DefineLogDomain(View);
 
 
 NSString* const kCBLViewChangeNotification = @"CBLViewChange";
@@ -51,6 +55,18 @@ NSString* const kCBLViewChangeNotification = @"CBLViewChange";
     return self;
 }
 
+- (BOOL) isEmpty {
+    return limit == 0 || (keys && keys.count == 0);
+}
+
+- (id) minKey {
+    return descending ? endKey : startKey;
+}
+
+- (id) maxKey {
+    return CBLKeyForPrefixMatch(descending ? startKey : endKey, prefixMatchLevel);
+}
+
 @end
 
 
@@ -76,7 +92,7 @@ NSString* const kCBLViewChangeNotification = @"CBLViewChange";
 }
 
 
-@synthesize name=_name, storage=_storage;
+@synthesize name=_name, storage=_storage, collation=_collation;
 
 
 - (NSString*) description {
@@ -136,7 +152,8 @@ NSString* const kCBLViewChangeNotification = @"CBLViewChange";
 
 - (CBLMapBlock) mapBlock {
     CBLMapBlock map = self.registeredMapBlock;
-    if (!map)
+    // Invoke view compiler if it's available:
+    if (!map && [self respondsToSelector: @selector(compileFromDesignDoc)])
         if ([self compileFromDesignDoc] == kCBLStatusOK)
             map = self.registeredMapBlock;
     return map;
@@ -209,58 +226,6 @@ static id<CBLViewCompiler> sCompiler;
 }
 
 
-- (CBLStatus) compileFromDesignDoc {
-    if (self.registeredMapBlock != nil)
-        return kCBLStatusOK;
-
-    // see if there's a design doc with a CouchDB-style view definition we can compile:
-    NSString* language;
-    NSDictionary* viewProps = $castIf(NSDictionary, [_weakDB getDesignDocFunction: self.name
-                                                                              key: @"views"
-                                                                         language: &language]);
-    if (!viewProps)
-        return kCBLStatusNotFound;
-    LogTo(View, @"%@: Attempting to compile %@ from design doc", self.name, language);
-    if (![CBLView compiler])
-        return kCBLStatusNotImplemented;
-    return [self compileFromProperties: viewProps language: language];
-}
-
-
-- (CBLStatus) compileFromProperties: (NSDictionary*)viewProps language: (NSString*)language {
-    if (!language)
-        language = @"javascript";
-    NSString* mapSource = viewProps[@"map"];
-    if (!mapSource)
-        return kCBLStatusNotFound;
-    CBLMapBlock mapBlock = [[CBLView compiler] compileMapFunction: mapSource language: language];
-    if (!mapBlock) {
-        Warn(@"View %@ could not compile %@ map fn: %@", _name, language, mapSource);
-        return kCBLStatusCallbackError;
-    }
-    NSString* reduceSource = viewProps[@"reduce"];
-    CBLReduceBlock reduceBlock = NULL;
-    if (reduceSource) {
-        reduceBlock = [[CBLView compiler] compileReduceFunction: reduceSource language: language];
-        if (!reduceBlock) {
-            Warn(@"View %@ could not compile %@ map fn: %@", _name, language, reduceSource);
-            return kCBLStatusCallbackError;
-        }
-    }
-
-    // Version string is based on a digest of the properties:
-    NSError* error;
-    NSString* version = CBLHexSHA1Digest([CBJSONEncoder canonicalEncoding: viewProps error: &error]);
-    [self setMapBlock: mapBlock reduceBlock: reduceBlock version: version];
-
-    self.documentType = $castIf(NSString, viewProps[@"documentType"]);
-    NSDictionary* options = $castIf(NSDictionary, viewProps[@"options"]);
-    _collation = ($equal(options[@"collation"], @"raw")) ? kCBLViewCollationRaw
-                                                         : kCBLViewCollationUnicode;
-    return kCBLStatusOK;
-}
-
-
 #pragma mark - INDEXING:
 
 
@@ -288,9 +253,27 @@ static id<CBLViewCompiler> sCompiler;
 }
 
 
-/** Updates the view's index, if necessary. (If no changes needed, returns kCBLStatusNotModified.)*/
-- (CBLStatus) updateIndex {
+/** Updates the view's index, if necessary. (If nothing changed, returns kCBLStatusNotModified.)*/
+- (CBLStatus) _updateIndex {
     return [self updateIndexes: self.viewsInGroup];
+}
+
+- (void) updateIndex {
+    CBLStatus status = [self updateIndexes: self.viewsInGroup];
+    if (CBLStatusIsError(status))
+        Warn(@"Error %d updating index of %@", status, self);
+}
+
+- (void) updateIndexAsync: (void (^)())onComplete {
+    CBLDatabase* db = self.database;
+    [db.manager backgroundTellDatabaseNamed: db.name to: ^(CBLDatabase *bgdb)
+     {
+         CBLView* bgview = [bgdb existingViewNamed: self.name];
+         [bgview updateIndex];
+         [db doAsync: ^{
+             onComplete();
+         }];
+     }];
 }
 
 - (CBLStatus) updateIndexAlone {
@@ -323,8 +306,14 @@ static id<CBLViewCompiler> sCompiler;
 #pragma mark - QUERYING:
 
 
-- (NSUInteger) totalRows {
+- (NSUInteger) currentTotalRows {
     return _storage.totalRows;
+}
+
+
+- (NSUInteger) totalRows {
+    [self updateIndex];
+    return [self currentTotalRows];
 }
 
 
@@ -349,34 +338,24 @@ static id<CBLViewCompiler> sCompiler;
 
 
 /** Main internal call to query a view. */
-- (CBLQueryIteratorBlock) _queryWithOptions: (CBLQueryOptions*)options
-                                     status: (CBLStatus*)outStatus
+- (CBLQueryEnumerator*) _queryWithOptions: (CBLQueryOptions*)options
+                                   status: (CBLStatus*)outStatus
 {
     if (!options)
         options = [CBLQueryOptions new];
-    CBLQueryIteratorBlock iterator;
-    if (options.fullTextQuery) {
-        iterator = [_storage fullTextQueryWithOptions: options status: outStatus];
-    } else if ([self groupOrReduceWithOptions: options])
-        iterator = [_storage reducedQueryWithOptions: options status: outStatus];
-    else
-        iterator = [_storage regularQueryWithOptions: options status: outStatus];
-    if (iterator)
+    else if (options.isEmpty)
+        return [[CBLQueryEnumerator alloc] initWithDatabase: self.database
+                                                       view: self
+                                             sequenceNumber: self.lastSequenceIndexed
+                                                       rows: nil];
+
+    CBLQueryEnumerator* e = [_storage queryWithOptions: options status: outStatus];
+    [e setDatabase: self.database view: self];
+    if (e)
         LogTo(Query, @"Query %@: Returning iterator", _name);
     else
         LogTo(Query, @"Query %@: Failed with status %d", _name, *outStatus);
-    return iterator;
-}
-
-
-// Should this query be run as grouped/reduced?
-- (BOOL) groupOrReduceWithOptions: (CBLQueryOptions*) options {
-    if (options->group || options->groupLevel > 0)
-        return YES;
-    else if (options->reduceSpecified)
-        return options->reduce;
-    else
-        return (self.reduceBlock != nil); // Reduce defaults to true iff there's a reduce block
+    return e;
 }
 
 

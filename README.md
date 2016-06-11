@@ -1,16 +1,16 @@
-# Couchbase Lite 
+[![Carthage compatible][carthage-svg]](carthage-link)
 
-[![Join the chat at https://gitter.im/couchbase/couchbase-lite-ios](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/couchbase/mobile?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+# Couchbase Lite 
 
 **Couchbase Lite** is an embedded lightweight, document-oriented (NoSQL), syncable database engine. 
 
 Get more info and downloads of Couchbase Lite (for iOS and Android) via [the Couchbase mobile portal](http://mobile.couchbase.com)
 
-[Click here for **official documentation for Couchbase Lite iOS**](http://developer.couchbase.com/mobile/)
+[Click here for **official documentation for Couchbase Lite iOS**](http://developer.couchbase.com/documentation/mobile/current/develop/training/build-first-ios-app/index.html)
 
 Latency matters a lot to users, so a local database takes frustration out of the equation. It’s got JSON documents, and the same map/reduce as Couchbase Server, in a pint-sized edition.
 
-Couchbase Lite compiles natively for iOS and Android. Half a megabyte optimized, for quick launch and snappy user experience on occasionally connected devices when data matters.
+Couchbase Lite compiles natively for iOS, Android, Mac OS and .NET. Half a megabyte optimized, for quick launch and snappy user experience on occasionally connected devices when data matters.
 
 **Lightweight** means:
 
@@ -36,12 +36,12 @@ Couchbase Lite compiles natively for iOS and Android. Half a megabyte optimized,
 * Conflicts can be detected and resolved, with app logic in full control of merging.
 * Revision trees allow for complex replication topologies, including server-to-server (for multiple data centers) and peer-to-peer, without data loss or false conflicts.
 
-The native APIs are Objective-C (iOS, Mac) and Java (Android), but an optional internal REST API adapter allows it to be called from other languages like JavaScript and C#, for use in apps built with PhoneGap, Titanium or MonoTouch.
+The native APIs are Objective-C (iOS, tvOS, Mac), Java (Android), and C# (.NET, Xamarin); but an optional internal REST API adapter allows it to be called from other languages like JavaScript, for use in apps built with PhoneGap/Cordova or Titanium.
 
 ## More Information
 
 * [Why Couchbase Lite?](https://github.com/couchbase/couchbase-lite-ios/wiki/Why-Couchbase-Lite%3F)
-* [The Guidebook](https://github.com/couchbase/couchbase-lite-ios/wiki/Guide%3A-Introduction)
+* [API Overview](http://developer.couchbase.com/documentation/mobile/current/get-started/couchbase-lite-overview/index.html)
 * [API Reference](http://couchbase.github.com/couchbase-lite-ios/docs/html/annotated.html)
 * There's lots more information on the [wiki][2].
 * Demo apps:
@@ -52,25 +52,26 @@ The native APIs are Objective-C (iOS, Mac) and Java (Android), but an optional i
 
 ## Platforms ##
 
- * **Mac OS X** -- 10.7.2 or higher.
- * **iOS** -- 6.0 or higher.
+ * **Mac OS X** -- 10.8 or higher.
+ * **iOS** -- 7.0 or higher.
+ * **tvOS** (AppleTV) -- 9.0 or higher.
  * **Android / Java** -- The [Android version of Couchbase Lite][11] is here.
+ * **.NET / Xamarin** -- The [C# version of Couchbase Lite][24] is here.
 
 ## Requirements ##
 
- * It's written in Objective-C.
- * Xcode 4.6+ is required to build it (Clang 3.1+, with GNUstep).
- * Runtime system requirements for Apple platforms are iOS 6+, or Mac OS X 10.7.2+.
+ * It's written in Objective-C and C++.
+ * Xcode 7 or later is required to build it.
 
 ## Credits ##
 
-**Design, coding:** Jens Alfke (jens@couchbase.com)  
-**Contributions from:** Alexander Edge, Chris Kau, David Venable, Derek Clarkson, Fabien Franzen, fcandalija, J Chris Anderson, Marty Schoch, Mike Lamb, Paul Mietz Egli, Robin Lu  
-**Technical advice from:** Damien Katz, Filipe Manana, and several other gurus on the CouchDB mailing list
+**Design, coding:** Jens Alfke (jens@couchbase.com), Pasin Suriyentrakorn (pasin@couchbase.com)
+**Contributions from:** Alexander Edge, Chris Kau, David Venable, Derek Clarkson, Fabien Franzen, fcandalija, J Chris Anderson, Marty Schoch, Mike Lamb, Paul Mietz Egli, Robin Lu, Traun Leyden, Fonkymasto, Tiago Duarte, cflorion, Evan Kyle, Qihe Bian, sarbogast, Tim Macfarlane, mglasgow, Manu Troquet, monowerker... 
+**Technical advice from:** Damien Katz, Filipe Manana, Robert Newson, and several other gurus on the CouchDB mailing list
  
 ## License ##
 
- * Couchbase Lite itself is under the Apache License 2.0.
+ * Couchbase Lite itself, and ForestDB, are under the Apache License 2.0.
  * [CocoaHTTPServer][9], by Robbie Hanson, is under the BSD License.
  * [FMDB][5], by [Gus Mueller][8], is under the MIT License.
  * [Google Toolbox For Mac][10] is under the Apache License 2.0.
@@ -87,6 +88,19 @@ Get Couchbase Lite via [the Couchbase mobile portal](http://mobile.couchbase.com
 ## Building Couchbase Lite ##
 
 If you want the very latest and greatest (and possibly buggy) version, you'll need to build it yourself. For instructions see the [wiki page][7].
+
+## Include via Carthage ##
+
+Can be included in any iOS project via [Carthage](https://github.com/carthage/carthage)
+ 
+Add the following line to your Cartfile:
+   
+```
+github "couchbase/couchbase-lite-ios" "release/1.2.0"
+```
+
+Run `carthage update --platform ios`, and you should now have the latest version of Couchbase Lite iOS in your Carthage folder.
+
 
 [1]: http://couchdb.apache.org
 [2]: https://github.com/couchbase/couchbase-lite-ios/wiki
@@ -108,5 +122,6 @@ If you want the very latest and greatest (and possibly buggy) version, you'll ne
 [21]: https://github.com/couchbaselabs/TouchDB-iOS
 [22]: https://github.com/couchbase/couchbase-lite-ios/wiki/Why-Couchbase-Lite%3F#history
 [23]: https://github.com/couchbase/couchbase-lite-ios/wiki/Replication-Algorithm
+[24]: https://github.com/couchbase/couchbase-lite-net
 
-[![githalytics.com alpha](https://cruel-carlota.pagodabox.com/dd0341b0dc5dcfad9f86b4ef5b44a65f "githalytics.com")](http://githalytics.com/couchbase/couchbase-lite-ios)
+ [carthage-svg]: https://img.shields.io/badge/Carthage-compatible-4BC51D.svg?style=flat

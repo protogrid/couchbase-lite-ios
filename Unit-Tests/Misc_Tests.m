@@ -12,6 +12,7 @@
 #import "CBLFacebookAuthorizer.h"
 #import "CBLPersonaAuthorizer.h"
 #import "CBLSymmetricKey.h"
+#import "MYAnonymousIdentity.h"
 
 
 @interface Misc_Tests : CBLTestCase
@@ -83,8 +84,12 @@
 }
 
 
-static BOOL parseRevID(NSString* revID, int *gen, NSString** suffix) {
-    return [CBL_Revision parseRevID: revID intoGeneration: gen andSuffix: suffix];
+static BOOL parseRevID(NSString* revIDStr, unsigned *gen, NSString** suffix) {
+
+    CBL_RevID* revID = revIDStr.cbl_asRevID;
+    *gen = revID.generation;
+    *suffix = revID.suffix;
+    return *gen > 0 && *suffix;
 }
 
 static int collateRevs(const char* rev1, const char* rev2) {
@@ -93,14 +98,14 @@ static int collateRevs(const char* rev1, const char* rev2) {
 
 - (void) test_ParseRevID {
     RequireTestCase(CBLDatabase);
-    int num;
+    unsigned num;
     NSString* suffix;
     Assert(parseRevID(@"1-utiopturoewpt", &num, &suffix));
-    AssertEq(num, 1);
+    AssertEq(num, 1u);
     AssertEqual(suffix, @"utiopturoewpt");
     
     Assert(parseRevID(@"321-fdjfdsj-e", &num, &suffix));
-    AssertEq(num, 321);
+    AssertEq(num, 321u);
     AssertEqual(suffix, @"fdjfdsj-e");
     
     Assert(!parseRevID(@"0-fdjfdsj-e", &num, &suffix));
@@ -231,7 +236,9 @@ static int collateRevs(const char* rev1, const char* rev2) {
     // -assertionForSite: should return nil because the assertion has expired by now:
     CBLPersonaAuthorizer* auth = [[CBLPersonaAuthorizer alloc] initWithEmailAddress: email];
     AssertEqual(auth.emailAddress, email);
-    AssertEqual([auth assertionForSite: originURL], nil);
+    [self allowWarningsIn:^{
+        AssertEqual([auth assertionForSite: originURL], nil);
+    }];
 }
 
 
@@ -289,6 +296,31 @@ static int collateRevs(const char* rev1, const char* rev2) {
         [incrementalOutput appendBytes: buf length: bytesRead];
     } while (bytesRead > 0);
     AssertEqual(incrementalOutput, incrementalCleartext);
+}
+
+
+- (void) test_AnonymousIdentity {
+    NSError* error;
+    MYDeleteAnonymousIdentity(@"CBLUnitTests");
+    SecIdentityRef ident = MYGetOrCreateAnonymousIdentity(@"CBLUnitTests", 100, &error);
+    Assert(ident != NULL, @"Couldn't create identity: %@", error);
+
+    SecCertificateRef cert = NULL;
+    AssertEq(SecIdentityCopyCertificate(ident, &cert), noErr);
+    CFAutorelease(cert);
+    NSString* summary = CFBridgingRelease(SecCertificateCopySubjectSummary(cert));
+    Log(@"Summary = %@", summary);
+    AssertEqual(summary, @"Anonymous");
+
+    SecTrustRef trust = NULL;
+    AssertEq(SecTrustCreateWithCertificates(cert, SecPolicyCreateSSL(YES, CFSTR("foo")), &trust), noErr);
+    CFAutorelease(trust);
+    SecTrustResultType result;
+    AssertEq(SecTrustEvaluate(trust, &result), noErr);
+    Log(@"Trust result = %d", result);
+    AssertEq(result, (SecTrustResultType)kSecTrustResultRecoverableTrustFailure);
+
+    MYDeleteAnonymousIdentity(@"CBLUnitTests");
 }
 
 

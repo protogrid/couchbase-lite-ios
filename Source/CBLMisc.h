@@ -7,7 +7,10 @@
 //
 
 #import <Foundation/Foundation.h>
-#import "CBL_Revision.h"
+
+
+/** Database sequence ID */
+typedef SInt64 SequenceNumber;
 
 
 // In a method/function implementation (not declaration), declaring an object parameter as
@@ -34,6 +37,9 @@ NSData* CBLHMACSHA256(NSData* key, NSData* data) __attribute__((nonnull));
 /** Writes a hex dump of the bytes to the output string.
     Returns a pointer to the end of the string (where it writes a null.) */
 char* CBLAppendHex( char *dst, const void* bytes, size_t length);
+
+/** Appends a decimal number to the output string. */
+size_t CBLAppendDecimal(char *buf, uint64_t n);
 
 /** Generates a digest string from a JSON-encodable object. Equal objects produce equal strings. */
 NSString* CBLDigestFromObject(id obj);
@@ -96,6 +102,12 @@ BOOL CBLRemoveFileIfExistsAsync(NSString* path, NSError** outError);
 /* Copy a file if it exists; does nothing if it doesn't. */
 BOOL CBLCopyFileIfExists(NSString*atPath, NSString* toPath, NSError** outError) __attribute__((nonnull(1, 2)));
 
+/** Replaces the directory at dstPath with the one at srcPath. (Both must already exist.)
+    Afterwards, on success, there will be a dir at dstPath but not at srcPath.
+    For safety's sake, the old directory is moved aside, then the new directory is moved in,
+    and only then is the old directory deleted. */
+BOOL CBLSafeReplaceDir(NSString* srcPath, NSString* dstPath, NSError** outError);
+
 /** Returns the hostname of this computer/device (will be of the form "___.local") */
 NSString* CBLGetHostName(void);
 
@@ -105,6 +117,11 @@ NSURL* CBLURLWithoutQuery( NSURL* url ) __attribute__((nonnull));
 /** Appends path components to a URL. These will NOT be URL-escaped, so you can include queries. */
 NSURL* CBLAppendToURL(NSURL* baseURL, NSString* toAppend) __attribute__((nonnull));
 
+/** Changes a given query max key into one that also extends to any key it matches as a prefix. */
+id CBLKeyForPrefixMatch(id key, unsigned depth);
+
+/** Stemmer name to use for the sqlite3-unicodesn tokenizer, based on current locale's language. */
+NSString* CBLStemmerNameForCurrentLocale(void);
 
 #if DEBUG
 NSString* CBLPathToTestFile(NSString* name);

@@ -14,8 +14,8 @@
 //  and limitations under the License.
 
 #import "CBLMultipartWriter.h"
-#import "CBLMisc.h"
-#import "GTMNSData+zlib.h"
+#import "CBL_Attachment.h"
+#import "CBLGZip.h"
 #import "CollectionUtils.h"
 #import "Test.h"
 
@@ -31,7 +31,7 @@
     self = [super init];
     if (self) {
         _contentType = [type copy];
-        _boundary = [(boundary ?: CBLCreateUUID()) copy];
+        _boundary = boundary ? [boundary copy] : [[NSUUID UUID] UUIDString];
         // Account for the final boundary to be written by -opened. Add its length now, because the
         // client is probably going to ask for my .length *before* it calls -open.
         NSString* finalBoundaryStr = $sprintf(@"\r\n--%@--", _boundary);
@@ -88,13 +88,33 @@
 
 - (void) addGZippedData: (NSData*)data {
     if (data.length >= kMinDataLengthToCompress) {
-        NSData* compressed = [NSData gtm_dataByGzippingData: data];
+        NSData* compressed = [CBLGZip dataByCompressingData: data];
         if (compressed.length < data.length) {
             data = compressed;
             [self setValue: @"gzip" forNextPartsHeader: @"Content-Encoding"];
         }
     }
     [self addData: data];
+}
+
+
+- (CBLStatus) addAttachment: (CBL_Attachment*)attachment {
+    NSString* disposition = $sprintf(@"attachment; filename=%@",
+                                     CBLQuoteString(attachment.name));
+    [self setNextPartsHeaders: $dict({@"Content-Disposition", disposition},
+                                     {@"Content-Type", attachment.contentType},
+                                     {@"Content-Encoding", attachment.encodingName})];
+    uint64_t contentLength;
+    NSInputStream *contentStream = [attachment getContentStreamDecoded: NO
+                                                             andLength: &contentLength];
+    if (!contentStream)
+        return kCBLStatusAttachmentNotFound;
+    uint64_t declaredLength = attachment.possiblyEncodedLength;
+    if (declaredLength != 0 && contentLength != declaredLength)
+        Warn(@"Attachment '%@' length mismatch; actually %llu, declared %llu",
+             attachment.name, contentLength, declaredLength);
+    [self addStream: contentStream length: contentLength];
+    return kCBLStatusOK;
 }
 
 

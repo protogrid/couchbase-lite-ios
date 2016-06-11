@@ -18,7 +18,11 @@
 #import "CBLReduceFuncs.h"
 #import "CBJSONEncoder.h"
 #import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLMisc.h"
+
+
+#define SWAP(A, B) {__typeof(A) temp = (A); (A) = (B); (B) = temp;}
 
 
 /*
@@ -61,6 +65,7 @@ enum {
     NSExpression* _queryEndKey;             // The endKey to use in queries
     NSExpression* _queryKeys;               // The 'keys' array to use in queries
     BOOL _queryInclusiveStart, _queryInclusiveEnd;  // The inclusiveStart/End to use in queries
+    BOOL _queryDescending;                  // The descending to use in queries
     uint8_t _queryPrefixMatchLevel;         // The prefixMatchLevel to use in queries
     NSPredicate* _queryFilter;              // Postprocessing filter predicate to use in the query
     NSArray* _querySort;                    // Sort descriptors for the query
@@ -76,7 +81,7 @@ enum {
 @synthesize mapPredicate=_mapPredicate, sortDescriptors=_querySort, filter=_queryFilter;
 @synthesize queryStartKey=_queryStartKey, queryEndKey=_queryEndKey, queryKeys=_queryKeys;
 @synthesize queryInclusiveStart=_queryInclusiveStart, queryInclusiveEnd=_queryInclusiveEnd;
-@synthesize docType=_docType;
+@synthesize queryDescending=_queryDescending, docType=_docType;
 #endif
 
 
@@ -274,6 +279,8 @@ static NSString* printExpr(NSExpression* expr) {
         if (_queryPrefixMatchLevel)
             [out appendFormat: @"query.prefixMatchLevel = %u;\n", _queryPrefixMatchLevel];
     }
+    if (_queryDescending)
+        [out appendFormat: @"query.descending = YES;\n"];
     if (_queryFilter)
         [out appendFormat: @"query.postFilter = %@;\n", _queryFilter];
     if (_querySort)
@@ -593,40 +600,34 @@ static NSString* printExpr(NSExpression* expr) {
 // Finds the expression(s) whose values (at map time) are to be emitted as the key.
 - (NSArray*) createKeyPredicates {
     NSMutableArray* keyPredicates = [NSMutableArray array];
-    if (_equalityKey)
+    if (_equalityKey) {
         [keyPredicates addObject: _equalityKey];
-    if (_otherKey)
-        [keyPredicates addObject: _otherKey];
-    else if (allAscendingSorts(_querySort)) {
-        // Add sort descriptors as extra components of the key so the index will sort by them:
-        NSUInteger i = 0;
-        for (NSSortDescriptor* sortDesc in _querySort) {
-            NSExpression* expr = [NSExpression expressionForKeyPath: sortDesc.key];
-            if (i++ == 0 && [expr isEqual: _equalityKey.leftExpression])
-                continue;   // This sort descriptor is already the 1st component of the key
-            NSComparisonPredicateOptions options = 0;
-            if (sortDesc.selector == @selector(caseInsensitiveCompare:))
-                options |= NSCaseInsensitivePredicateOption;
-            [keyPredicates addObject: [NSComparisonPredicate
-                    predicateWithLeftExpression: expr
-                                rightExpression: [NSExpression expressionForConstantValue: nil]
-                                       modifier: NSDirectPredicateModifier
-                                           type: NSLessThanPredicateOperatorType
-                                        options: options]];
-        }
-        _querySort = nil;
+
+        // If primary sort matches the equality key, it's a no-op so we can ignore it:
+        if (sortMatchesExpression(_querySort.firstObject, _equalityKey.leftExpression))
+            _querySort = [_querySort subarrayWithRange: NSMakeRange(1, _querySort.count-1)];
     }
 
-    // Remove redundant values that are already part of the key:
-    NSMutableArray* values = [_valueTemplate mutableCopy];
-    for (NSComparisonPredicate* cp in keyPredicates) {
-        NSExpression* expr = cp.leftExpression;
-        if (expr.expressionType == NSKeyPathExpressionType && cp.options == 0) {
-            [values removeObject: expr];
-            [values removeObject: expr.keyPath];
+    if (_equalityKey && _equalityKey.predicateOperatorType == NSInPredicateOperatorType) {
+        // In an "x in $y" query the keys have to match exactly, so can't add components to the key.
+    } else {
+        if (_otherKey)
+            [keyPredicates addObject: _otherKey];
+
+        if (sortsCanBeIndexed(_querySort)) {
+            if (!_otherKey || sortMatchesExpression(_querySort.firstObject,
+                                                    _otherKey.leftExpression)) {
+                if (![_querySort[0] ascending])
+                    _queryDescending = YES;
+                if (_otherKey)
+                    _querySort = [_querySort subarrayWithRange: NSMakeRange(1, _querySort.count-1)];
+                // Add the sort descs as extra components of the key so the index will sort by them:
+                for (NSSortDescriptor* sortDesc in _querySort)
+                    [keyPredicates addObject: sortDescriptorToPredicate(sortDesc)];
+                _querySort = nil;
+            }
         }
     }
-    _valueTemplate = [values copy];
 
     return keyPredicates;
 }
@@ -636,14 +637,18 @@ static NSString* printExpr(NSExpression* expr) {
 - (NSArray*) createQuerySortDescriptors {
     if (_querySort.count == 0)
         return nil;
-
-    NSMutableArray* sort = [NSMutableArray arrayWithCapacity: _querySort.count];
-    for (NSSortDescriptor* sd in _querySort) {
-        [sort addObject: [[NSSortDescriptor alloc] initWithKey: [self rewriteKeyPath: sd.key]
-                                                     ascending: sd.ascending
-                                                      selector: sd.selector]];
-    }
-    return sort;
+    return [_querySort my_map: ^NSSortDescriptor*(NSSortDescriptor* sd) {
+        NSString* key = [self rewriteKeyPath: sd.key];
+        if (sd.comparator) {
+            return [[NSSortDescriptor alloc] initWithKey: key
+                                               ascending: sd.ascending
+                                              comparator: sd.comparator];
+        } else {
+            return [[NSSortDescriptor alloc] initWithKey: key
+                                               ascending: sd.ascending
+                                                selector: sd.selector];
+        }
+    }];
 }
 
 
@@ -774,6 +779,10 @@ static NSExpression* keyExprForQuery(NSComparisonPredicate* cp) {
 - (BOOL) precomputeQuery {
     _queryInclusiveStart = _queryInclusiveEnd = YES;
 
+    // If there are no key ranges at all, there's nothing to set up.
+    if (!_equalityKey && !_otherKey)
+        return YES;
+
     if (_equalityKey.predicateOperatorType == NSInPredicateOperatorType) {
         // Using "key in $SET", so query should use .keys instead of .startKey/.endKey
         _queryKeys = keyExprForQuery(_equalityKey);
@@ -808,7 +817,7 @@ static NSExpression* keyExprForQuery(NSComparisonPredicate* cp) {
                 [startKey addObject: keyExpr];
                 _queryInclusiveStart = (op == NSGreaterThanOrEqualToPredicateOperatorType);
                 if (endKey.count > 0)
-                    [endKey addObject: @{}];
+                    [endKey addObject: [NSExpression expressionForConstantValue: @{}]];
                 break;
             case NSBeginsWithPredicateOperatorType:
                 [startKey addObject: keyExpr];
@@ -837,6 +846,11 @@ static NSExpression* keyExprForQuery(NSComparisonPredicate* cp) {
         _queryStartKey = startKey.firstObject;
         _queryEndKey   = endKey.firstObject;
     }
+
+    if (_queryDescending) {
+        SWAP(_queryStartKey, _queryEndKey);
+        SWAP(_queryInclusiveStart, _queryInclusiveEnd);
+    }
     return YES;
 }
 
@@ -859,6 +873,7 @@ static NSExpression* keyExprForQuery(NSComparisonPredicate* cp) {
         query.inclusiveEnd = _queryInclusiveEnd;
         query.prefixMatchLevel = _queryPrefixMatchLevel;
     }
+    query.descending = _queryDescending;
     query.sortDescriptors = _querySort;
     query.postFilter = [_queryFilter predicateWithSubstitutionVariables: mutableContext];
     return query;
@@ -886,11 +901,46 @@ static NSExpression* keyExprForQuery(NSComparisonPredicate* cp) {
 }
 
 
-static bool allAscendingSorts(NSArray* sortDescriptors) {
-    for (NSSortDescriptor* s in sortDescriptors)
-        if (!s.ascending)
+// Returns YES if all the sort descriptors can be used as part of the view key
+static bool sortsCanBeIndexed(NSArray* sortDescriptors) {
+    if (sortDescriptors.count == 0)
+        return NO;
+    BOOL ascending = [sortDescriptors.firstObject ascending];
+    for (NSSortDescriptor* s in sortDescriptors) {
+        if (s.ascending != ascending)
             return NO;
+        if (s.comparator != nil)
+            return NO;
+        SEL sel = s.selector;
+        if (sel != @selector(compare:) && sel != @selector(caseInsensitiveCompare:))
+            return NO;
+    }
     return YES;
+}
+
+
+// Returns YES if the sort descriptor matches the expression (same keyPath)
+static bool sortMatchesExpression(NSSortDescriptor* sort, NSExpression* expr) {
+    return sort
+        && !sort.comparator
+        && expr.expressionType == NSKeyPathExpressionType
+        && [expr.keyPath isEqual: sort.key];
+}
+
+
+// Returns an NSComparisonPredicate based on an NSSortDescriptor. It's not fully filled out
+// -- the comparison is "< nil" -- but it acts as a placeholder in
+static NSComparisonPredicate* sortDescriptorToPredicate(NSSortDescriptor* sortDesc) {
+    NSExpression* expr = [NSExpression expressionForKeyPath: sortDesc.key];
+    NSComparisonPredicateOptions options = 0;
+    if (sortDesc.selector == @selector(caseInsensitiveCompare:))
+        options |= NSCaseInsensitivePredicateOption;
+    NSExpression* nilExpr = [NSExpression expressionForConstantValue: nil];
+    return [NSComparisonPredicate predicateWithLeftExpression: expr
+                                              rightExpression: nilExpr
+                                                     modifier: NSDirectPredicateModifier
+                                                         type: NSLessThanPredicateOperatorType
+                                                      options: options];
 }
 
 
@@ -913,9 +963,6 @@ static NSComparisonPredicate* flipComparison(NSComparisonPredicate* cp) {
                                                             type: kFlipped[op]
                                                          options: cp.options];
 }
-
-
-#define SWAP(A, B) {__typeof(A) temp = (A); (A) = (B); (B) = temp;}
 
 
 // If the two predicates can be merged with an AND, returns the merged form; else returns nil.

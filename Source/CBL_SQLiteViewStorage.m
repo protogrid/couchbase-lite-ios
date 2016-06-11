@@ -21,6 +21,7 @@
 #import "CBLCollateJSON.h"
 #import "CouchbaseLitePrivate.h"
 #import "CBLInternal.h"
+#import "CBLMisc.h"
 #import "ExceptionUtils.h"
 
 #import "FMDatabase.h"
@@ -118,7 +119,7 @@
             geokey BLOB)";
     NSError* error;
     if (![self runStatements: sql error: &error])
-        Warn(@"Couldn't create view index `%@`: %@", _name, error);
+        Warn(@"Couldn't create view index `%@`: %@", _name, error.my_compactDescription);
 }
 
 - (void) finishCreatingIndex {
@@ -127,7 +128,7 @@
         CREATE INDEX IF NOT EXISTS 'maps_#_sequence' ON 'maps_#'(sequence)";
     NSError* error;
     if (![self runStatements: sql error: &error])
-        Warn(@"Couldn't create view SQL index `%@`: %@", _name, error);
+        Warn(@"Couldn't create view SQL index `%@`: %@", _name, error.my_compactDescription);
 }
 
 
@@ -139,7 +140,7 @@
         UPDATE views SET lastSequence=0, total_docs=0 WHERE view_id=#";
     NSError* error;
     if (![self runStatements: sql error: &error])
-        Warn(@"Couldn't delete view index `%@`: %@", _name, error);
+        Warn(@"Couldn't delete view index `%@`: %@", _name, error.my_compactDescription);
 }
 
 
@@ -151,19 +152,27 @@
         Warn(@"Can't index full text: SQLite isn't built with FTS3 or FTS4 module");
         return NO;
     }
-    NSString* sql = @"\
-        CREATE VIRTUAL TABLE IF NOT EXISTS fulltext USING fts4(content, tokenize=unicodesn);\
+
+    // Derive the stemmer language name based on the current locale's language.
+    NSString* stemmerName = CBLStemmerNameForCurrentLocale();
+    NSString* stemmer = @"";
+    if (stemmerName)
+        stemmer = $sprintf(@"\"stemmer=%@\"", stemmerName);
+
+    NSString* sql = $sprintf(@"\
+        CREATE VIRTUAL TABLE IF NOT EXISTS fulltext \
+            USING fts4(content, tokenize=unicodesn %@);\
         CREATE INDEX IF NOT EXISTS  'maps_#_by_fulltext' ON 'maps_#'(fulltext_id); \
         CREATE TRIGGER IF NOT EXISTS 'del_maps_#_fulltext' \
             DELETE ON 'maps_#' WHEN old.fulltext_id not null BEGIN \
-                DELETE FROM fulltext WHERE rowid=old.fulltext_id| END";
+                DELETE FROM fulltext WHERE rowid=old.fulltext_id| END", stemmer);
     //OPT: Would be nice to use partial indexes but that requires SQLite 3.8 and makes
     // the db file only readable by SQLite 3.8+, i.e. the file would not be portable to
     // iOS 8 which only has SQLite 3.7 :(
     // On the above index we could add "WHERE fulltext_id not null".
     NSError* error;
     if (![self runStatements: sql error: &error]) {
-        Warn(@"Error initializing fts4 schema: %@", error);
+        Warn(@"Error initializing fts4 schema: %@", error.my_compactDescription);
         return NO;
     }
     _initializedFullTextSchema = YES;
@@ -185,7 +194,7 @@
             DELETE FROM bboxes WHERE rowid=old.bbox_id| END";
     NSError* error;
     if (![self runStatements: sql error: &error]) {
-        Warn(@"Error initializing rtree schema: %@", error);
+        Warn(@"Error initializing rtree schema: %@", error.my_compactDescription);
         return NO;
     }
     _initializedRTreeSchema = YES;
@@ -280,7 +289,7 @@
                 Assert(view != self,
                        @"Cannot index view %@: no map block registered",
                        view.name);
-                LogTo(ViewVerbose, @"    %@ has no map block; skipping it", view.name);
+                LogVerbose(View, @"    %@ has no map block; skipping it", view.name);
                 continue;
             }
 
@@ -301,7 +310,7 @@
                 if (last == 0)
                     [view createIndex];
                 minLastSequence = MIN(minLastSequence, last);
-                LogTo(ViewVerbose, @"    %@ last indexed at #%lld", view.name, last);
+                LogVerbose(View, @"    %@ last indexed at #%lld", view.name, last);
 
                 NSString* docType = delegate.documentType;
                 if (docType) {
@@ -392,13 +401,20 @@
                     keepGoing = [r next];
                     continue;
                 }
-                NSString* revID = [r stringForColumnIndex: 3];
+                CBL_RevID* revID = [r revIDForColumnIndex: 3];
                 NSData* json = [r dataForColumnIndex: 4];
                 BOOL deleted = [r boolForColumnIndex: 5];
                 NSString* docType = checkDocTypes ? [r stringForColumnIndex: 6] : nil;
 
                 // Skip rows with the same doc_id -- these are losing conflicts.
+                NSMutableArray<NSString*>* conflicts = nil;
                 while ((keepGoing = [r next]) && [r longLongIntForColumnIndex: 0] == doc_id) {
+                    if (!deleted) {
+                        // Conflict revisions:
+                        if (!conflicts)
+                            conflicts = $marray();
+                        [conflicts addObject: [r stringForColumnIndex: 3]];
+                    }
                 }
 
                 SequenceNumber realSequence = sequence; // because sequence may be changed, below
@@ -407,15 +423,14 @@
                     CBL_FMResultSet* r2 = [fmdb executeQuery:
                                     @"SELECT revid, sequence FROM revs "
                                      "WHERE doc_id=? AND sequence<=? AND current!=0 AND deleted=0 "
-                                     "ORDER BY revID DESC "
-                                     "LIMIT 1",
+                                     "ORDER BY revID DESC",
                                     @(doc_id), @(minLastSequence)];
                     if (!r2) {
                         [r close];
                         return dbStorage.lastDbError;
                     }
                     if ([r2 next]) {
-                        NSString* oldRevID = [r2 stringForColumnIndex:0];
+                        CBL_RevID* oldRevID = [r2 revIDForColumnIndex:0];
                         // This is the revision that used to be the 'winner'.
                         // Remove its emitted rows:
                         SequenceNumber oldSequence = [r2 longLongIntForColumnIndex: 1];
@@ -427,14 +442,24 @@
                             viewTotalRows[@(view.viewID)] =
                                 @([viewTotalRows[@(view.viewID)] intValue] - changes);
                         }
-                        if (deleted || CBLCompareRevIDs(oldRevID, revID) > 0) {
+                        if (deleted || [oldRevID compare: revID] > 0) {
                             // It still 'wins' the conflict, so it's the one that
                             // should be mapped [again], not the current revision!
+                            CBL_RevID* temp = revID;
                             revID = oldRevID;
+                            oldRevID = temp;
                             deleted = NO;
                             sequence = oldSequence;
                             json = [fmdb dataForQuery: @"SELECT json FROM revs WHERE sequence=?",
                                     @(sequence)];
+                        }
+                        if (!deleted) {
+                            // Conflict revisions:
+                            if (!conflicts)
+                                conflicts = $marray();
+                            [conflicts addObject: oldRevID.asString];
+                            while ([r2 next])
+                                [conflicts addObject: [r2 stringForColumnIndex:0]];
                         }
                     }
                     [r2 close];
@@ -454,6 +479,9 @@
                 }
                 curDoc[@"_local_seq"] = @(sequence);
 
+                if (conflicts)
+                    curDoc[@"_conflicts"] = conflicts;
+
                 // Call the user-defined map() to emit new key/value pairs from this revision:
                 int i = -1;
                 for (curView in views) {
@@ -464,13 +492,14 @@
                             if (viewDocType && ![viewDocType isEqual: docType])
                                 continue; // skip; view's documentType doesn't match this doc
                         }
-                        LogTo(ViewVerbose, @"#%lld: map \"%@\" for view %@...",
+                        LogVerbose(View, @"#%lld: map \"%@\" for view %@...",
                               sequence, docID, curView.name);
                         @try {
                             ((CBLMapBlock)mapBlocks[i])(curDoc, emit);
                         } @catch (NSException* x) {
-                            MYReportException(x, @"map block of view '%@'", curView.name);
-                            emitStatus = kCBLStatusCallbackError;
+                            MYReportException(x, @"map block of view %@, on doc %@",
+                                              curView.name, curDoc);
+                            // don't abort; continue to next doc
                         }
                         if (CBLStatusIsError(emitStatus)) {
                             [r close];
@@ -523,7 +552,7 @@
     NSData* geoKey = nil;
     if ([key isKindOfClass: [CBLSpecialKey class]]) {
         CBLSpecialKey *specialKey = key;
-        LogTo(ViewVerbose, @"    emit(%@, %@)", specialKey, valueJSON.my_UTF8ToString);
+        LogVerbose(View, @"    emit(%@, %@)", specialKey, valueJSON.my_UTF8ToString);
         BOOL ok;
         NSString* text = specialKey.text;
         if (text) {
@@ -544,8 +573,12 @@
             return dbStorage.lastDbError;
         key = nil;
     } else {
+        if (!key) {
+            Warn(@"emit() called with nil key; ignoring");
+            return kCBLStatusOK;
+        }
         keyJSON = toJSONData(key);
-        LogTo(ViewVerbose, @"    emit(%@, %@)", keyJSON.my_UTF8ToString, valueJSON.my_UTF8ToString);
+        LogVerbose(View, @"    emit(%@, %@)", keyJSON.my_UTF8ToString, valueJSON.my_UTF8ToString);
     }
 
     if (!keyJSON)
@@ -571,6 +604,37 @@ static NSString* viewNames(NSArray* views) {
 #pragma mark - QUERYING:
 
 
+/** Main internal call to query a view. */
+- (CBLQueryEnumerator*) queryWithOptions: (CBLQueryOptions*)options
+                                  status: (CBLStatus*)outStatus
+{
+    SequenceNumber lastSeq = self.lastSequenceIndexed;
+    NSArray* rows;
+    if (options.fullTextQuery)
+        rows = [self fullTextQueryWithOptions: options status: outStatus];
+    else if ([self groupOrReduceWithOptions: options])
+        rows = [self reducedQueryWithOptions: options status: outStatus];
+    else
+        rows = [self regularQueryWithOptions: options status: outStatus];
+
+    if (!rows)
+        return nil;
+    return [[CBLQueryEnumerator alloc] initWithSequenceNumber: lastSeq rows: rows];
+    //OPT: Return objects from enum as they're found, without collecting them in an array first
+}
+
+
+// Should this query be run as grouped/reduced?
+- (BOOL) groupOrReduceWithOptions: (CBLQueryOptions*) options {
+    if (options->group || options->groupLevel > 0)
+        return YES;
+    else if (options->reduceSpecified)
+        return options->reduce;
+    else
+        return (_delegate.reduceBlock != nil); // Reduce defaults to true iff there's a reduce block
+}
+
+
 typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString* docID,
                                    CBL_FMResultSet* r);
 
@@ -579,9 +643,6 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
 - (CBLStatus) _runQueryWithOptions: (const CBLQueryOptions*)options
                              onRow: (QueryRowBlock)onRow
 {
-    if (!options)
-        options = [CBLQueryOptions new];
-
     // OPT: It would be faster to use separate tables for raw-or ascii-collated views so that
     // they could be indexed with the right collation, instead of having to specify it here.
     NSString* collationStr = @"";
@@ -616,13 +677,11 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         [sql appendString:@")"];
     }
 
-    id minKey = options.startKey, maxKey = options.endKey;
+    id minKey = options.minKey, maxKey = options.maxKey;
     NSString* minKeyDocID = options.startKeyDocID;
     NSString* maxKeyDocID = options.endKeyDocID;
     BOOL inclusiveMin = options->inclusiveStart, inclusiveMax = options->inclusiveEnd;
     if (options->descending) {
-        minKey = options.endKey;
-        maxKey = options.startKey;
         inclusiveMin = options->inclusiveEnd;
         inclusiveMax = options->inclusiveStart;
         minKeyDocID = options.endKeyDocID;
@@ -642,7 +701,6 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         }
     }
     if (maxKey) {
-        maxKey = keyForPrefixMatch(maxKey, options->prefixMatchLevel);
         NSData* maxKeyData = toJSONData(maxKey);
         [sql appendString: (inclusiveMax ? @" AND key <= ?" :  @" AND key < ?")];
         [sql appendString: collationStr];
@@ -680,7 +738,7 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
     [args addObject: @(limit)];
     [args addObject: @(options->skip)];
 
-    LogTo(View, @"Query %@: %@\n\tArguments: %@", _name, sql, args);
+    LogTo(Query, @"Query %@: %@\n\tArguments: %@", _name, sql, args);
     
     CBL_SQLiteStorage* dbStorage = _dbStorage;
     CBL_FMDatabase* fmdb = dbStorage.fmdb;
@@ -714,8 +772,8 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
 }
 
 
-- (CBLQueryIteratorBlock) regularQueryWithOptions: (CBLQueryOptions*)options
-                                           status: (CBLStatus*)outStatus
+- (NSArray*) regularQueryWithOptions: (CBLQueryOptions*)options
+                              status: (CBLStatus*)outStatus
 {
     CBL_SQLiteStorage* db = _dbStorage;
 
@@ -741,12 +799,12 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         CBL_Revision* docRevision = nil;
         if (options->includeDocs) {
             NSDictionary* value = nil;
-            if (valueData && ![self rowValueIsEntireDoc: valueData])
+            if (valueData && !CBLQueryRowValueIsEntireDoc(valueData))
                 value = $castIf(NSDictionary, fromJSON(valueData));
             NSString* linkedID = value.cbl_id;
             if (linkedID) {
                 // Linked document: http://wiki.apache.org/couchdb/Introduction_to_CouchDB_views#Linked_documents
-                NSString* linkedRev = value.cbl_rev; // usually nil
+                CBL_RevID* linkedRev = value.cbl_rev; // usually nil
                 CBLStatus linkedStatus;
                 docRevision = [db getDocumentWithID: linkedID
                                          revisionID: linkedRev
@@ -755,13 +813,13 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
                 sequence = docRevision.sequence;
             } else {
                 docRevision = [_dbStorage revisionWithDocID: docID
-                                                      revID: [r stringForColumnIndex: 4]
+                                                      revID: [r revIDForColumnIndex: 4]
                                                     deleted: NO
                                                    sequence: sequence
                                                        json: [r dataForColumnIndex: 5]];
             }
         }
-        LogTo(ViewVerbose, @"Query %@: Found row with key=%@, value=%@, id=%@",
+        LogVerbose(Query, @"Query %@: Found row with key=%@, value=%@, id=%@",
               _name, [keyData my_UTF8ToString], [valueData my_UTF8ToString],
               toJSONString(docID));
         CBLQueryRow* row;
@@ -775,19 +833,17 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
                                             boundingBox: bbox
                                             geoJSONData: [r dataForColumn: @"geokey"]
                                                   value: valueData
-                                            docRevision: docRevision
-                                                storage: self];
+                                            docRevision: docRevision];
         } else {
             row = [[CBLQueryRow alloc] initWithDocID: docID
                                             sequence: sequence
                                                  key: keyData
                                                value: valueData
-                                         docRevision: docRevision
-                                             storage: self];
+                                         docRevision: docRevision];
         }
 
         if (filter) {
-            if (!filter(row))
+            if (![self row: row passesFilter: filter])
                 return kCBLStatusOK;
             if (skip > 0) {
                 --skip;
@@ -797,7 +853,7 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         
         [rows addObject: row];
 
-        if (limit-- == 0)
+        if (--limit == 0)
             return 0;  // stops the iteration
         return kCBLStatusOK;
     }];
@@ -821,15 +877,13 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         }
         rows = sortedRows;
     }
-
-    //OPT: Return objects from enum as they're found, without collecting them in an array first
-    return queryIteratorBlockFromArray(rows);
+    return rows;
 }
 
 
 /** Runs a full-text query of a view, using the FTS4 table. */
-- (CBLQueryIteratorBlock) fullTextQueryWithOptions: (const CBLQueryOptions*)options
-                                            status: (CBLStatus*)outStatus
+- (NSArray*) fullTextQueryWithOptions: (const CBLQueryOptions*)options
+                               status: (CBLStatus*)outStatus
 {
     if (![self createFullTextSchema]) {
         *outStatus = kCBLStatusNotImplemented;
@@ -850,13 +904,17 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         [sql appendString: @" DESC"];
     [sql appendString: @" LIMIT ? OFFSET ?"];
     int limit = (options->limit != kCBLQueryOptionsDefaultLimit) ? options->limit : -1;
+    CBLQueryRowFilter filter = options.filter;
 
     CBL_SQLiteStorage* dbStorage = _dbStorage;
     CBL_FMResultSet* r = [dbStorage.fmdb executeQuery: [self queryString: sql],
                                                 options.fullTextQuery,
                                                 @(limit), @(options->skip)];
     if (!r) {
-        *outStatus = dbStorage.lastDbError;
+        if (dbStorage.fmdb.lastErrorCode == SQLITE_ERROR)
+            *outStatus = kCBLStatusBadRequest;      // SQLITE_ERROR means invalid FTS query string
+        else
+            *outStatus = dbStorage.lastDbError;
         return nil;
     }
     NSMutableArray* rows = [[NSMutableArray alloc] init];
@@ -869,8 +927,7 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
             CBLFullTextQueryRow* row = [[CBLFullTextQueryRow alloc] initWithDocID: docID
                                                                          sequence: sequence
                                                                        fullTextID: fulltextID
-                                                                            value: valueData
-                                                                          storage: self];
+                                                                            value: valueData];
             // Parse the offsets as a space-delimited list of numbers, into an NSArray.
             // (See http://sqlite.org/fts3.html#section_4_1 )
             NSArray* offsets = [[r stringForColumnIndex: 4] componentsSeparatedByString: @" "];
@@ -883,35 +940,21 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
 
             if (options->fullTextSnippets)
                 row.snippet = [r stringForColumnIndex: 5];
-            if (!options.filter || options.filter(row))
+            if (!filter || [self row: row passesFilter: filter])
                 [rows addObject: row];
         }
     }
-
-    //OPT: Return objects from enum as they're found, without collecting them in an array first
-    return queryIteratorBlockFromArray(rows);
+    return rows;
 }
 
 
-// Changes a maxKey into one that also extends to any key it matches as a prefix.
-static id keyForPrefixMatch(id key, unsigned depth) {
-    if (depth < 1)
-        return key;
-    if ([key isKindOfClass: [NSString class]]) {
-        // Kludge: prefix match a string by appending max possible character value to it
-        return [key stringByAppendingString: @"\uffffffff"];
-    } else if ([key isKindOfClass: [NSArray class]]) {
-        NSMutableArray* nuKey = [key mutableCopy];
-        if (depth == 1) {
-            [nuKey addObject: @{}];
-        } else {
-            id lastObject = keyForPrefixMatch(nuKey.lastObject, depth-1);
-            [nuKey replaceObjectAtIndex: nuKey.count-1 withObject: lastObject];
-        }
-        return nuKey;
-    } else {
-        return key;
-    }
+- (BOOL) row: (CBLQueryRow*)row passesFilter: (CBLQueryRowFilter)filter {
+    //FIX: I'm not supposed to know the delegates' real classes...
+    [row moveToDatabase: _dbStorage.delegate view: _delegate];
+    if (!filter(row))
+        return NO;
+    [row _clearDatabase];
+    return YES;
 }
 
 
@@ -923,14 +966,17 @@ static inline NSString* toJSONString( id object ) {
                                  options: CBLJSONWritingAllowFragments
                                    error: NULL];
 }
-#endif
 
 static inline NSData* toJSONData( id object ) {
     if (!object)
         return nil;
-    return [CBLJSON dataWithJSONObject: object
-                               options: CBLJSONWritingAllowFragments
-                                 error: NULL];
+    NSError* error;
+    NSData* json = [CBLJSON dataWithJSONObject: object
+                                       options: CBLJSONWritingAllowFragments
+                                         error: &error];
+    if (!json)
+        Warn(@"Could not convert key/value to JSON: %@ -- %@", object, error.my_compactDescription);
+    return json;
 }
 
 static id fromJSON( NSData* json ) {
@@ -940,6 +986,7 @@ static id fromJSON( NSData* json ) {
                                options: CBLJSONReadingAllowFragments
                                  error: NULL];
 }
+#endif
 
 
 #pragma mark - REDUCING/GROUPING:
@@ -984,10 +1031,11 @@ static id callReduce(CBLReduceBlock reduceBlock, NSMutableArray* keys, NSMutable
 }
 
 
-- (CBLQueryIteratorBlock) reducedQueryWithOptions: (CBLQueryOptions*)options
-                                           status: (CBLStatus*)outStatus
+- (NSArray*) reducedQueryWithOptions: (CBLQueryOptions*)options
+                              status: (CBLStatus*)outStatus
 {
     CBL_SQLiteStorage* db = _dbStorage;
+    CBLQueryRowFilter filter = options.filter;
     unsigned groupLevel = options->groupLevel;
     bool group = options->group || groupLevel > 0;
     CBLReduceBlock reduce = _delegate.reduceBlock;
@@ -1022,20 +1070,19 @@ static id callReduce(CBLReduceBlock reduceBlock, NSMutableArray* keys, NSMutable
                                                              sequence: 0
                                                                   key: key
                                                                 value: reduced
-                                                          docRevision: nil
-                                                              storage: self];
-                if (!options.filter || options.filter(row))
+                                                          docRevision: nil];
+                if (!filter || [self row: row passesFilter: filter])
                     [rows addObject: row];
                 [keysToReduce removeAllObjects];
                 [valuesToReduce removeAllObjects];
             }
             lastKeyData = [keyData copy];
         }
-        LogTo(ViewVerbose, @"Query %@: Will reduce row with key=%@, value=%@",
+        LogVerbose(Query, @"Query %@: Will reduce row with key=%@, value=%@",
               _name, [keyData my_UTF8ToString], [valueData my_UTF8ToString]);
 
         id valueOrData = valueData;
-        if (valuesToReduce && [self rowValueIsEntireDoc: valueData]) {
+        if (valuesToReduce && CBLQueryRowValueIsEntireDoc(valueData)) {
             // map fn emitted 'doc' as value, which was stored as a "*" placeholder; expand now:
             CBLStatus status;
             CBL_Revision* rev = [db getDocumentWithID: docID
@@ -1055,28 +1102,17 @@ static id callReduce(CBLReduceBlock reduceBlock, NSMutableArray* keys, NSMutable
         // Finish the last group (or the entire list, if no grouping):
         id key = group ? groupKey(lastKeyData, groupLevel) : $null;
         id reduced = callReduce(reduce, keysToReduce, valuesToReduce);
-        LogTo(ViewVerbose, @"Query %@: Reduced to key=%@, value=%@",
+        LogVerbose(Query, @"Query %@: Reduced to key=%@, value=%@",
               _name, toJSONString(key), toJSONString(reduced));
         CBLQueryRow* row = [[CBLQueryRow alloc] initWithDocID: nil
                                                      sequence: 0
                                                           key: key
                                                         value: reduced
-                                                  docRevision: nil
-                                                      storage: self];
-        if (!options.filter || options.filter(row))
+                                                  docRevision: nil];
+        if (!filter || [self row: row passesFilter: filter])
             [rows addObject: row];
     }
-
-    //OPT: Return objects from enum as they're found, without collecting them in an array first
-    return queryIteratorBlockFromArray(rows);
-}
-
-
-static CBLQueryIteratorBlock queryIteratorBlockFromArray(NSArray* rows) {
-    NSEnumerator* rowEnum = rows.objectEnumerator;
-    return ^CBLQueryRow*() {
-        return rowEnum.nextObject;
-    };
+    return rows;
 }
 
 
@@ -1108,16 +1144,6 @@ static CBLQueryIteratorBlock queryIteratorBlockFromArray(NSArray* rows) {
 
 - (id<CBL_QueryRowStorage>) storageForQueryRow: (CBLQueryRow*)row {
     return self;
-}
-
-
-- (BOOL) rowValueIsEntireDoc: (NSData*)valueData {
-    return valueData.length == 1 && *(const char*)valueData.bytes == '*';
-}
-
-
-- (id) parseRowValue: (NSData*)valueData {
-    return fromJSON(valueData);
 }
 
 

@@ -6,22 +6,41 @@
 //  Copyright (c) 2012-2013 Couchbase, Inc. All rights reserved.
 //
 
-#import "CBLAuthenticator.h"
+#import <CouchbaseLite/CBLAuthenticator.h>
+#import <Security/SecBase.h>
 
 
 /** Internal protocol for authenticating a user to a server.
     (The word "authorization" here is a misnomer, but HTTP uses it for historical reasons.) */
 @protocol CBLAuthorizer <CBLAuthenticator>
+@end
 
-/** Should generate and return an authorization string for the given request.
-    The string, if non-nil, will be set as the value of the "Authorization:" HTTP header. */
-- (NSString*) authorizeURLRequest: (NSMutableURLRequest*)request
-                         forRealm: (NSString*)realm;
 
-- (NSString*) authorizeHTTPMessage: (CFHTTPMessageRef)message
-                          forRealm: (NSString*)realm;
 
-@optional
+/** Authorizer that uses a username/password (i.e. HTTP Basic or Digest auth) */
+@protocol CBLCredentialAuthorizer <CBLAuthorizer>
+
+@property (readonly) NSURLCredential* credential;
+
+@end
+
+
+
+/** Authorizer that adds custom headers to an HTTP request */
+@protocol CBLCustomHeadersAuthorizer <CBLAuthorizer>
+
+/** Should add a header to the request to convey the authorization token. */
+- (void) authorizeURLRequest: (NSMutableURLRequest*)request;
+
+/** Should add a header to the message to convey the authorization token. */
+- (void) authorizeHTTPMessage: (CFHTTPMessageRef)message;
+
+@end
+
+
+
+/** Authorizer that sends a login request that sets a session cookie. */
+@protocol CBLLoginAuthorizer <CBLAuthorizer>
 
 - (NSString*) loginPathForSite: (NSURL*)site;
 - (NSDictionary*) loginParametersForSite: (NSURL*)site;
@@ -30,12 +49,10 @@
 
 
 
-/** Simple implementation of CBLAuthorizer that does HTTP Basic Auth. */
-@interface CBLBasicAuthorizer : NSObject <CBLAuthorizer>
-{
-    @private
-    NSURLCredential* _credential;
-}
+/** Simple implementation of CBLPasswordAuthorizer. */
+@interface CBLPasswordAuthorizer : NSObject <CBLCredentialAuthorizer, CBLCustomHeadersAuthorizer>
+
+- (instancetype) initWithUser: (NSString*)user password: (NSString*)password;
 
 /** Initialize given a credential object that contains a username and password. */
 - (instancetype) initWithCredential: (NSURLCredential*)credential;
@@ -48,22 +65,11 @@
 
 
 
-#if 0 // UNUSED
-/** Implementation of CBLAuthorizer that supports MAC authorization as used in OAuth 2. */
-@interface CBLMACAuthorizer : NSObject <CBLAuthorizer>
-{
-@private
-    NSString *_key, *_identifier;
-    NSDate* _issueTime;
-    NSData* (*_hmacFunction)(NSData*, NSData*);
+/** Sets the global list of anchor certs to be used by CBLCheckSSLServerTrust. */
+void CBLSetAnchorCerts(NSArray* certs, BOOL onlyThese);
 
-}
+/** Checks server trust, using the global list of anchor certs. */
+BOOL CBLCheckSSLServerTrust(SecTrustRef trust, NSString* host, UInt16 port, NSData *pinned);
 
-/** Initialize given MAC credentials */
-- (instancetype) initWithKey: (NSString*)key
-                  identifier: (NSString*)identifier
-                   algorithm: (NSString*)algorithm
-                   issueTime: (NSDate*)issueTime;
-
-@end
-#endif
+/** Forces a SecTrustRef's result to be a success. */
+BOOL CBLForceTrusted(SecTrustRef trust);

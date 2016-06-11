@@ -8,7 +8,7 @@
 
 #import "CBL_Revision.h"
 #import "CBL_StorageTypes.h"
-@class CBLDatabaseChange, CBLManager, CBLSymmetricKey;
+@class CBLDatabaseChange, CBLManager, CBLSymmetricKey, MYAction;
 @protocol CBL_ViewStorage;
 @protocol CBL_StorageDelegate;
 
@@ -20,7 +20,7 @@
 // INITIALIZATION AND CONFIGURATION:
 
 /** Preflight to see if a database file exists in this directory. Called _before_ -open! */
-- (BOOL) databaseExistsIn: (NSString*)directory;
++ (BOOL) databaseExistsIn: (NSString*)directory;
 
 /** Opens storage. Files will be created in the directory, which must already exist.
     @param directory  The existing directory to put data files into. The implementation may
@@ -89,7 +89,7 @@
     @param outStatus  If returning nil, store a CBLStatus error value here.
     @return  The revision, or nil if not found. */
 - (CBL_MutableRevision*) getDocumentWithID: (NSString*)docID
-                                revisionID: (NSString*)revID
+                                revisionID: (CBL_RevID*)revID
                                   withBody: (BOOL)withBody
                                     status: (CBLStatus*)outStatus;
 
@@ -106,33 +106,36 @@
 /** Retrieves the parent revision of a revision, or returns nil if there is no parent. */
 - (CBL_Revision*) getParentRevision: (CBL_Revision*)rev;
 
-/** Returns the given revision's list of direct ancestors (as CBL_Revision objects) in _reverse_
-    chronological order, starting with the revision itself. */
-- (NSArray*) getRevisionHistory: (CBL_Revision*)rev;
-
-/** Returns the revision history as a _revisions dictionary, as returned by the REST API's ?revs=true option. If 'ancestorRevIDs' is present, the revision history will only go back as far as any of the revision ID strings in that array. */
-- (NSDictionary*) getRevisionHistoryDict: (CBL_Revision*)rev
-                       startingFromAnyOf: (NSArray*)ancestorRevIDs;
+/** Returns an array of CBL_Revisions giving the revision history in reverse order, starting from
+    `rev` and going back to any of the revision IDs in `ancestorRevIDs` (or all the way back if
+    that array is empty or nil.) */
+- (NSArray<CBL_RevID*>*) getRevisionHistory: (CBL_Revision*)rev
+                               backToRevIDs: (NSSet<CBL_RevID*>*)ancestorRevIDs;
 
 /** Returns all the known revisions (or all current/conflicting revisions) of a document.
     @param docID  The document ID
     @param onlyCurrent  If YES, only leaf revisions (whether or not deleted) should be returned.
     @return  An array of all available revisions of the document. */
 - (CBL_RevisionList*) getAllRevisionsOfDocumentID: (NSString*)docID
-                                      onlyCurrent: (BOOL)onlyCurrent;
+                                      onlyCurrent: (BOOL)onlyCurrent
+                                   includeDeleted: (BOOL)includeDeleted;
 
 /** Returns IDs of local revisions of the same document, that have a lower generation number.
-    Does not return revisions whose bodies have been compacted away, or deletion markers.
-    If 'onlyAttachments' is true, only revisions with attachments will be returned. */
-- (NSArray*) getPossibleAncestorRevisionIDs: (CBL_Revision*)rev
-                                      limit: (unsigned)limit
-                            onlyAttachments: (BOOL)onlyAttachments;
+    If possible, returns only leaf revisions; if none match, returns non-leaves.
+    @param rev  The revision to look for ancestors of. Only its docID and revID are used.
+    @param limit  The maximum number of results to return, or if 0, unlimited.
+    @param outHaveBodies  On return, if not NULL, then *outHaveBodies will be YES if all the
+                          revisions returned have their JSON bodies available, otherwise NO.
+    @return  An array of revIDs of existing revisions that could be ancestors of `rev`. */
+- (NSArray<CBL_RevID*>*) getPossibleAncestorRevisionIDs: (CBL_Revision*)rev
+                                                  limit: (unsigned)limit
+                                             haveBodies: (BOOL*)outHaveBodies;
 
 /** Returns the most recent member of revIDs that appears in rev's ancestry.
     In other words: Look at the revID properties of rev, its parent, grandparent, etc.
     As soon as you find a revID that's in the revIDs array, stop and return that revID.
     If no match is found, return nil. */
-- (NSString*) findCommonAncestorOf: (CBL_Revision*)rev withRevIDs: (NSArray*)revIDs;
+- (CBL_RevID*) findCommonAncestorOf: (CBL_Revision*)rev withRevIDs: (NSArray<CBL_RevID*>*)revIDs;
 
 /** Looks for each given revision in the local database, and removes each one found from the list.
     On return, therefore, `revs` will contain only the revisions that don't exist locally. */
@@ -145,8 +148,8 @@
 - (NSSet*) findAllAttachmentKeys: (NSError**)outError;
 
 /** Iterates over all documents in the database, according to the given query options. */
-- (CBLQueryIteratorBlock) getAllDocs: (CBLQueryOptions*)options
-                              status: (CBLStatus*)outStatus;
+- (CBLQueryEnumerator*) getAllDocs: (CBLQueryOptions*)options
+                            status: (CBLStatus*)outStatus;
 
 /** Returns all database changes with sequences greater than `lastSequence`.
     @param  lastSequence  The sequence number to start _after_
@@ -160,7 +163,7 @@
                                     filter: (CBL_RevisionFilter)filter
                                     status: (CBLStatus*)outStatus;
 
-// INSERTION / DELETION:
+// INSERTION / DELETION / PURGING:
 
 /** Creates a new revision of a document.
     On success, before returning the new CBL_Revision, the implementation will also call the
@@ -176,14 +179,16 @@
                 the operation by returning an error status.
     @param status  On return a status will be stored here. Note that on success, the
                 status should be 201 for a created revision but 200 for a deletion.
+    @param outError  On return, an error indicating a reason of the failure
     @return  The new revision, with its revID and sequence filled in, or nil on error. */
 - (CBL_Revision*) addDocID: (NSString*)docID
-                 prevRevID: (NSString*)prevRevID
+                 prevRevID: (CBL_RevID*)prevRevID
                 properties: (NSMutableDictionary*)properties
                   deleting: (BOOL)deleting
              allowConflict: (BOOL)allowConflict
            validationBlock: (CBL_StorageValidationBlock)validationBlock
-                    status: (CBLStatus*)status;
+                    status: (CBLStatus*)status
+                     error: (NSError**)outError;
 
 /** Inserts an already-existing revision (with its revID), plus its ancestry, into a document.
     This is called by the pull replicator to add the revisions received from the server.
@@ -197,20 +202,33 @@
                 the operation by returning an error status.
     @param source  The URL of the remote database this was pulled from, or nil if it's local.
                 (This will be used to create the CBLDatabaseChange object sent to the delegate.)
+    @param outError  On return, an error indicating a reason of the failure.
     @return  Status code; 200 on success, otherwise an error. */
 - (CBLStatus) forceInsert: (CBL_Revision*)inRev
-          revisionHistory: (NSArray*)history
+          revisionHistory: (NSArray<CBL_RevID*>*)history
           validationBlock: (CBL_StorageValidationBlock)validationBlock
-                   source: (NSURL*)source;
+                   source: (NSURL*)source
+                    error: (NSError**)outError;
 
 /** Purges specific revisions, which deletes them completely from the local database _without_ adding a "tombstone" revision. It's as though they were never there.
-    @param docsToRevs  A dictionary mapping document IDs to arrays of revision IDs.
-                        The magic revision ID "*" means "all revisions", indicating that the
+    @param docsToRevs  A dictionary mapping document IDs to arrays of revision ID strings.
+                        The magic revision ID string "*" means "all revisions", indicating that the
                         document should be removed entirely from the database.
     @param outResult  On success will point to an NSDictionary with the same form as docsToRev, containing the doc/revision IDs that were actually removed. */
 - (CBLStatus) purgeRevisions: (NSDictionary*)docsToRevs
                       result: (NSDictionary**)outResult;
 
+/** Returns a document's expiration date as a Unix timestamp, or 0 for no expiration. */
+- (UInt64) expirationOfDocument: (NSString*)docID;
+
+/** Sets a document's expiration to a Unix timestamp, or 0 for no expiration. */
+- (BOOL) setExpiration: (UInt64)timestamp ofDocument: (NSString*)docID;
+
+/** Returns the next time at which a document will expire. */
+- (UInt64) nextDocumentExpiry;
+
+/** Triggers purging of documents whose expiration time has passed. */
+- (NSUInteger) purgeExpiredDocuments;
 
 // VIEWS:
 
@@ -233,7 +251,7 @@
     @param revID  The revision ID, or nil to return the current revision.
     @return  A revision containing the body of the document, or nil if not found. */
 - (CBL_MutableRevision*) getLocalDocumentWithID: (NSString*)docID
-                                     revisionID: (NSString*)revID;
+                                     revisionID: (CBL_RevID*)revID;
 
 /** Creates / updates / deletes a local document.
     @param revision  The new revision to save. Its docID must be set but the revID is ignored.
@@ -246,9 +264,21 @@
                     else an error.)
     @return  The new revision, with revID filled in, or nil on error. */
 - (CBL_Revision*) putLocalRevision: (CBL_Revision*)revision
-                    prevRevisionID: (NSString*)prevRevID
+                    prevRevisionID: (CBL_RevID*)prevRevID
                           obeyMVCC: (BOOL)obeyMVCC
                             status: (CBLStatus*)outStatus;
+
+@optional
+
+/** Low-memory warning; free up resources if possible. */
+- (void) lowMemoryWarning;
+
+/** Registers the encryption key of the database file. Must be called before opening the db. */
+- (void) setEncryptionKey: (CBLSymmetricKey*)key;
+
+/** Called when the delegate changes its encryptionKey property. The storage should rewrite its
+    files using the new key (which may be nil, meaning no encryption.) */
+- (MYAction*) actionToChangeEncryptionKey: (CBLSymmetricKey*)newKey;
 
 @end
 
@@ -258,21 +288,10 @@
 /** Delegate of a CBL_Storage instance. CBLDatabase implements this. */
 @protocol CBL_StorageDelegate <NSObject>
 
-/** Optional encryption key registered with this database. */
-@property (readonly) CBLSymmetricKey* encryptionKey;
-
 /** Called whenever the outermost transaction completes.
     @param committed  YES on commit, NO if the transaction was aborted. */
 - (void) storageExitedTransaction: (BOOL)committed;
 
 /** Called whenever a revision is added to the database (but not for local docs or for purges.) */
 - (void) databaseStorageChanged: (CBLDatabaseChange*)change;
-
-/** Generates a revision ID for a new revision.
-    @param json  The canonical JSON of the revision (with metadata properties removed.)
-    @param deleted  YES if this revision is a deletion
-    @param prevID  The parent's revision ID, or nil if this is a new document. */
-- (NSString*) generateRevIDForJSON: (NSData*)json
-                           deleted: (BOOL)deleted
-                         prevRevID: (NSString*)prevID;
 @end

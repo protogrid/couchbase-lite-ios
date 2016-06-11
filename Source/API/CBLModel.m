@@ -17,12 +17,15 @@
 #import "CBLModelFactory.h"
 #import "CBLModelArray.h"
 #import "CBLDatabase+Attachments.h"
-#import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLMisc.h"
 #import "CBLBase64.h"
 
 #import <objc/message.h>
 #import <objc/runtime.h>
+
+
+//DefineLogDomain(Model);   // This is actually in CBLDynamicObject.m
 
 
 @implementation CBLModel
@@ -37,11 +40,12 @@
     self = [super init];
     if (self) {
         if (document) {
-            LogTo(CBLModel, @"%@ initWithDocument: %@ @%p", self.class, document, document);
+            LogTo(Model, @"%@ initWithDocument: %@ @%p", self.class, document, document);
             self.document = document;
+            _isNew = (document.currentRevisionID == nil);
             [self didLoadFromDocument];
         } else {
-            LogTo(CBLModel, @"%@ initWithDatabase: %@", self.class, database);
+            LogTo(Model, @"%@ initWithDatabase: %@", self.class, database);
             _isNew = true;
             self.database = database;
         }
@@ -59,10 +63,7 @@
 
 + (instancetype) modelForNewDocumentInDatabase: (CBLDatabase*)database {
     NSParameterAssert(database);
-    if (self == [CBLModel class]) {
-        Warn(@"Couldn't create a model object for a new document from the base CBLModel class.");
-        return nil;
-    }
+    Assert(self != [CBLModel class], @"Must be called on a subclass of CBLModel");
 
     CBLModel *model = [[self alloc] initWithDocument:nil orDatabase:database];
     NSString *documentType = [database.modelFactory documentTypeForClass:[self class]];
@@ -95,7 +96,7 @@
 
 - (void) dealloc
 {
-    LogTo(CBLModel, @"%@ dealloc", self);
+    LogTo(Model, @"%@ dealloc", self);
     if(_needsSave)
         Warn(@"%@ dealloced with unsaved changes!", self); // should be impossible
     _document.modelObject = nil;
@@ -107,6 +108,14 @@
                 self.class, CBLAbbreviate(self.document.documentID)];
 }
 
+
+- (id) debugQuickLookObject {
+    NSDictionary* props = [self propertiesToSave];
+    return $sprintf(@"%@ %@",
+                    [self class],
+                    [CBLJSON stringWithJSONObject: props options: CBLJSONWritingPrettyPrinted
+                                            error: NULL]);
+}
 
 #pragma mark - DOCUMENT / DATABASE:
 
@@ -139,7 +148,7 @@
         // On setting database, create a new untitled/unsaved CBLDocument:
         NSString* docID = [self idForNewDocumentInDatabase: db];
         self.document = docID ? [db documentWithID: docID] : [db createDocument];
-        LogTo(CBLModel, @"%@ made new document", self);
+        LogTo(Model, @"%@ made new document", self);
     } else {
         [self deleteDocument: nil];
     }
@@ -150,7 +159,7 @@
     CBLSavedRevision* rev = _document.currentRevision;
     if (!rev)
         return YES;
-    LogTo(CBLModel, @"%@ Deleting document", self);
+    LogTo(Model, @"%@ Deleting document", self);
     [self willSave: nil];
     NSDictionary* properties = self.propertiesToSaveForDeletion;
     if (!properties) {
@@ -188,8 +197,8 @@
     if (_saving)
         return;  // this is just an echo from my -justSave: method, below, so ignore it
     
-    LogTo(CBLModel, @"%@ External change (rev=%@)", self, _document.currentRevisionID);
-    _isNew = false;
+    LogTo(Model, @"%@ External change (rev=%@)", self, _document.currentRevisionID);
+    _isNew = (_document.currentRevisionID == nil);
     [self markExternallyChanged];
     
     // Prepare to send KVO notifications about all my properties in case they changed:
@@ -197,15 +206,12 @@
     for (NSString* key in keys)
         [self willChangeValueForKey: key];
 
-    if (doc.isDeleted) {
-        // If doc was deleted, revert any unsaved changes and mark doc as unchanged:
+    if (doc.isDeleted || _isNew) {
+        // If doc was deleted or purged, revert any unsaved changes and mark doc as unchanged:
         _properties = nil;
         _changedNames = nil;
         _changedAttachments = nil;
         self.needsSave = NO;
-        // Detach from document:
-        _document.modelObject = nil;
-        _document = nil;
 
     } else {
         // Otherwise, remove unchanged cached values in _properties:
@@ -326,7 +332,7 @@
         return YES;
     [self willSave: _changedNames];
     NSDictionary* properties = self.propertiesToSave;
-    LogTo(CBLModel, @"%@ Saving <- %@", self, properties);
+    LogTo(Model, @"%@ Saving <- %@", self, properties);
     NSError* error;
     bool ok;
 
@@ -341,10 +347,10 @@
         if (outError)
             *outError = error;
         else
-            Warn(@"%@: Save failed: %@", self, error);
+            Warn(@"%@: Save failed: %@", self, error.my_compactDescription);
         return NO;
     }
-    LogTo(CBLModel, @"%@ Saved as rev %@", self, _document.currentRevisionID);
+    LogTo(Model, @"%@ Saved as rev %@", self, _document.currentRevisionID);
     return YES;
 }
 
@@ -481,7 +487,7 @@
     NSParameterAssert(_document);
     id curValue = [self getValueOfProperty: property];
     if (!$equal(value, curValue)) {
-        LogTo(CBLModel, @"%@ .%@ := \"%@\"", self, property, value);
+        LogTo(Model, @"%@ .%@ := \"%@\"", self, property, value);
         [self cacheValue: value ofProperty: property changed: YES];
         [self markNeedsSave];
     }
@@ -563,7 +569,7 @@ typedef id (*idMsgSend)(id self, SEL sel);
                                              wherePredicate: pred
                                                     orderBy: nil
                                                       error: &error];
-        Assert(builder, @"Couldn't create query builder: %@", error);
+        Assert(builder, @"Couldn't create query builder: %@", error.my_compactDescription);
         [factory setQueryBuilder: builder forClass: fromClass property:relation];
     }
 
@@ -571,7 +577,7 @@ typedef id (*idMsgSend)(id self, SEL sel);
     NSError* error;
     CBLQueryEnumerator* e = [q run: &error];
     if (!e) {
-        Warn(@"Querying for inverse of %@.%@ failed: %@", fromClass, relation, error);
+        Warn(@"Querying for inverse of %@.%@ failed: %@", fromClass, relation, error.my_compactDescription);
         return nil;
     }
     NSMutableArray* docIDs = $marray();
