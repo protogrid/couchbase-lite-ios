@@ -51,6 +51,12 @@ extern double CouchbaseLiteVersionNumber; // Defined in Xcode-generated Couchbas
 #endif
 
 
+
+/** DRU 18.06.2015: Added declaration of global variable (used in vendor/MYUtilities/Logging.m) */
+BOOL gMYWarnRaisesException;
+
+
+
 NSString* CBLVersion( void ) {
     if (CouchbaseLiteVersionNumber > 0)
         return $sprintf(@"%s (build %g)", CBL_VERSION_STRING, CouchbaseLiteVersionNumber);
@@ -157,6 +163,13 @@ static CBLManager* sInstance;
         _customHTTPHeaders = [NSMutableDictionary dictionary];
     }
     return self;
+}
+
+
+/** DRU 18.06.2015: Added parameter to init-function */
+- (instancetype) initWithExceptionOnWarning: (BOOL)exceptionOnWarning {
+    gMYWarnRaisesException = exceptionOnWarning;
+    return [self init];
 }
 
 
