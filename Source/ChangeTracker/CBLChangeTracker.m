@@ -78,7 +78,7 @@
         _heartbeat = kDefaultHeartbeat;
         _includeConflicts = includeConflicts;
         self.lastSequenceID = lastSequenceID;
-        _usePOST = YES;
+        _usePOST = NO;
     }
     return self;
 }
@@ -117,11 +117,11 @@
     NSString* filterName = _docIDs ?  @"_doc_ids" : _filterName;
     if (filterName) {
         [path appendFormat: @"&filter=%@", CBLEscapeURLParam(filterName)];
-
         if (!_usePOST) {
             // Add filter or doc_ids to URL. If sending a POST, these will go in JSON body instead.
             NSDictionary* filterParameters = _docIDs ? @{@"doc_ids": _docIDs} : _filterParameters;
             for (NSString* key in filterParameters) {
+//                Warn(@"Filter parameter: Key '%@'", key);
                 NSString* value = filterParameters[key];
                 if (![value isKindOfClass: [NSString class]]) {
                     // It's ambiguous whether non-string filter params are allowed.
@@ -134,12 +134,14 @@
                         continue;
                     }
                 }
+//                Warn(@"Filter parameter: Key '%@', Value '%@'", key, value);
                 [path appendFormat: @"&%@=%@", CBLEscapeURLParam(key),
                                                CBLEscapeURLParam(value)];
             }
         }
     }
 
+//    Warn(@"Replication Filter: Path '%@', _usePOST: %d, filterName: %@, filterParameters: %@", path, _usePOST, filterName, [_filterParameters description]);
     return path;
 }
 
